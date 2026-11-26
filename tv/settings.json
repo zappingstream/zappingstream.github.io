@@ -1,15 +1,17 @@
 {
   "appSettings": {
     "stage": {
+      "w": 1920,
+      "h": 1080,
       "clearColor": "0x00000000",
       "useImageWorker": true,
-      "boundsMargin": [200, 200, 200, 200]
+      "boundsMargin": [120, 120, 120, 120]
     },
     "debug": false
   },
   "platformSettings": {
     "path": "./static",
-    "log": true,
+    "log": false,
     "showVersion": false
   }
 }

@@ -3,7 +3,7 @@
  * SDK version: 5.5.7
  * CLI version: 2.14.2
  * 
- * Generated: Sat, 20 Jun 2026 15:08:42 GMT
+ * Generated: Thu, 26 Nov 2026 22:37:23 GMT
  */
 
 var APP_com_domain_app_ZappingStream = (function () {
@@ -6671,49 +6671,368 @@ var APP_com_domain_app_ZappingStream = (function () {
     }
   }
 
-  const API_URL$1 = 'https://zappingstream-api.vercel.app/channels';
-  const getChannels = async () => {
-    try {
-      // 4. Obtener el token validado por reCAPTCHA
-      // Ejemplo de cómo podrías obtenerlo (dependerá de la librería que uses):
-      // const token = await getRecaptchaToken();
+  const getFreshImage = (url, dateString) => {
+    if (!url) return '';
+    if (!dateString) return url;
+    const parsed = new Date(dateString).getTime();
+    if (isNaN(parsed)) return url;
+    const separator = url.indexOf('?') !== -1 ? '&' : '?';
+    return "".concat(url).concat(separator, "t=").concat(parsed);
+  };
+  const getOptimizedImageUrl = function (url) {
+    let width = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : 400;
+    let dateString = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : '';
+    if (!url) return '';
+    let src = url.replace(/(maxresdefault|hqdefault|sddefault)\.jpg/i, 'mqdefault.jpg');
+    if (dateString) {
+      src = getFreshImage(src, dateString);
+    }
+    if (src.indexOf('ytimg.com') !== -1 || src.indexOf('youtube.com') !== -1 || src.indexOf('ggpht.com') !== -1 || src.indexOf('googleusercontent.com') !== -1) {
+      return "https://wsrv.nl/?url=".concat(encodeURIComponent(src), "&w=").concat(width, "&output=webp");
+    }
+    return src;
+  };
+  const formatTimeOnly = dateString => {
+    if (!dateString) return '--:--';
+    const date = new Date(dateString);
+    if (isNaN(date.getTime())) return '--:--';
+    return date.toLocaleTimeString('es-AR', {
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false
+    });
+  };
+  const isSameLocalDay = (dateA, dateB) => {
+    if (!dateA || !dateB) return false;
+    return dateA.getFullYear() === dateB.getFullYear() && dateA.getMonth() === dateB.getMonth() && dateA.getDate() === dateB.getDate();
+  };
 
-      // 5. Adjuntar el token en los headers de tu fetch original
+  const API_URL$1 = 'https://zappingstream-api.vercel.app/channels';
+
+  // Caché en memoria durante la sesión para no volver a consultar videos ya verificados
+  const verifiedVideoIds = new Set();
+  const deletedVideoIds = new Set();
+  const validatedDayKeys = new Set();
+  const DAY_MS = 24 * 60 * 60 * 1000;
+  const SCHEDULE_WINDOW_DAYS = 8;
+  const toDayKey = date => {
+    if (!date) return '';
+    return "".concat(date.getFullYear(), "-").concat(date.getMonth() + 1, "-").concat(date.getDate());
+  };
+  const getEffectiveDateString = video => {
+    if (!video) return '';
+    return video.ActualStartTime || video.ScheduledStartTime || video.AddedAt || '';
+  };
+  const sortActiveStreams = list => {
+    return list.slice().sort((a, b) => {
+      if (a.IsPremiere && !b.IsPremiere) return 1;
+      if (!a.IsPremiere && b.IsPremiere) return -1;
+      const timeA = new Date(getEffectiveDateString(a) || 0).getTime();
+      const timeB = new Date(getEffectiveDateString(b) || 0).getTime();
+      return (isNaN(timeB) ? 0 : timeB) - (isNaN(timeA) ? 0 : timeA);
+    });
+  };
+  const normalizeVideoMap = function (videos) {
+    let options = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : {};
+    const _options$checkDateWin = options.checkDateWindow,
+      checkDateWindow = _options$checkDateWin === void 0 ? false : _options$checkDateWin,
+      _options$minTime = options.minTime,
+      minTime = _options$minTime === void 0 ? 0 : _options$minTime,
+      _options$maxTime = options.maxTime,
+      maxTime = _options$maxTime === void 0 ? 0 : _options$maxTime,
+      _options$requireSched = options.requireScheduled,
+      requireScheduled = _options$requireSched === void 0 ? false : _options$requireSched;
+    if (!videos || typeof videos !== 'object') return {};
+    const entries = Array.isArray(videos) ? videos.map((v, idx) => [v && v.VideoId ? v.VideoId : String(idx), v]) : Object.entries(videos);
+    const clean = {};
+    const seenIds = new Set();
+    for (let i = 0; i < entries.length; i++) {
+      const _entries$i = _slicedToArray(entries[i], 2),
+        v = _entries$i[1];
+      if (!v || typeof v !== 'object') continue;
+      if (v.ToBeCut === true || v.IsDeleted === true || v.Deleted === true) continue;
+      const videoId = typeof v.VideoId === 'string' ? v.VideoId.trim() : '';
+      if (!videoId || deletedVideoIds.has(videoId) || seenIds.has(videoId)) continue;
+      if (requireScheduled && !v.ScheduledStartTime && !v.ActualStartTime) continue;
+      const effectiveStart = getEffectiveDateString(v);
+      if (checkDateWindow) {
+        if (!effectiveStart) continue;
+        const ts = new Date(effectiveStart).getTime();
+        if (isNaN(ts) || ts < minTime || ts > maxTime) continue;
+      }
+      seenIds.add(videoId);
+      clean[videoId] = {
+        ...v,
+        VideoId: videoId,
+        EffectiveStartTime: effectiveStart
+      };
+    }
+    return clean;
+  };
+  const findFallbackVideoId = channel => {
+    const extractFirst = collection => {
+      if (!collection || typeof collection !== 'object') return null;
+      const list = Array.isArray(collection) ? collection : Object.values(collection);
+      for (let i = 0; i < list.length; i++) {
+        const item = list[i];
+        if (item && item.ToBeCut !== true && typeof item.VideoId === 'string' && item.VideoId.trim() !== '' && !deletedVideoIds.has(item.VideoId.trim())) {
+          return item.VideoId.trim();
+        }
+      }
+      return null;
+    };
+    return extractFirst(channel.Past) || extractFirst(channel.Upcoming) || null;
+  };
+  const buildCleanChannel = (rawChannel, minTime, maxTime) => {
+    const actives = normalizeVideoMap(rawChannel.Actives, {
+      checkDateWindow: false
+    });
+    const upcoming = normalizeVideoMap(rawChannel.Upcoming, {
+      checkDateWindow: true,
+      minTime,
+      maxTime,
+      requireScheduled: true
+    });
+    const past = normalizeVideoMap(rawChannel.Past, {
+      checkDateWindow: true,
+      minTime,
+      maxTime
+    });
+    const activeList = sortActiveStreams(Object.values(actives));
+    return {
+      ...rawChannel,
+      FallbackVideoId: rawChannel.FallbackVideoId || findFallbackVideoId(rawChannel),
+      Actives: actives,
+      Upcoming: upcoming,
+      Past: past,
+      ActiveList: activeList
+    };
+  };
+
+  /**
+   * Verifica antes del renderizado WebGL si un video de YouTube fue borrado o puesto en privado.
+   * YouTube devuelve HTTP 404 o un placeholder gris de 120x90 para mqdefault.jpg cuando el stream
+   * fue eliminado, mientras que cualquier transmisión válida devuelve 320x180.
+   * Usar Image() nativo sin crossOrigin no consume memoria de texturas WebGL ni sufre bloqueos CORS.
+   */
+  const probeSingleVideo = function (videoId) {
+    let timeoutMs = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : 2200;
+    if (!videoId) return Promise.resolve(false);
+    if (deletedVideoIds.has(videoId)) return Promise.resolve(false);
+    if (verifiedVideoIds.has(videoId)) return Promise.resolve(true);
+    return new Promise(resolve => {
+      if (typeof Image === 'undefined') {
+        verifiedVideoIds.add(videoId);
+        resolve(true);
+        return;
+      }
+      const img = new Image();
+      let settled = false;
+      const finish = isValid => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        img.onload = null;
+        img.onerror = null;
+        img.src = '';
+        if (isValid) {
+          verifiedVideoIds.add(videoId);
+        } else {
+          deletedVideoIds.add(videoId);
+        }
+        resolve(isValid);
+      };
+      const timer = setTimeout(() => {
+        // Ante red lenta de TV no borramos preventivamente una transmisión válida
+        finish(true);
+      }, timeoutMs);
+      img.onload = () => {
+        if (img.naturalWidth > 0 && img.naturalWidth <= 120 && img.naturalHeight <= 90) {
+          finish(false);
+        } else {
+          finish(true);
+        }
+      };
+      img.onerror = () => {
+        finish(false);
+      };
+      img.src = "https://i.ytimg.com/vi/".concat(encodeURIComponent(videoId), "/mqdefault.jpg");
+    });
+  };
+  const probeVideoBatch = async function (videoIds) {
+    let concurrency = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : 24;
+    let timeoutMs = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : 2200;
+    const pending = videoIds.filter(id => id && !verifiedVideoIds.has(id) && !deletedVideoIds.has(id));
+    if (pending.length === 0) return 0;
+    let cursor = 0;
+    let newlyDeleted = 0;
+    const worker = async () => {
+      while (cursor < pending.length) {
+        const idx = cursor++;
+        const id = pending[idx];
+        const ok = await probeSingleVideo(id, timeoutMs);
+        if (!ok) newlyDeleted++;
+      }
+    };
+    const workersCount = Math.min(concurrency, pending.length);
+    const workers = [];
+    for (let i = 0; i < workersCount; i++) {
+      workers.push(worker());
+    }
+    await Promise.all(workers);
+    return newlyDeleted;
+  };
+  const purgeDeletedFromChannels = channels => {
+    if (!Array.isArray(channels) || deletedVideoIds.size === 0) return channels;
+    const filterRecord = record => {
+      if (!record) return {};
+      const out = {};
+      const keys = Object.keys(record);
+      for (let i = 0; i < keys.length; i++) {
+        const k = keys[i];
+        const v = record[k];
+        if (v && v.VideoId && !deletedVideoIds.has(v.VideoId)) {
+          out[k] = v;
+        }
+      }
+      return out;
+    };
+    return channels.map(ch => {
+      const actives = filterRecord(ch.Actives);
+      const upcoming = filterRecord(ch.Upcoming);
+      const past = filterRecord(ch.Past);
+      return {
+        ...ch,
+        Actives: actives,
+        Upcoming: upcoming,
+        Past: past,
+        ActiveList: sortActiveStreams(Object.values(actives))
+      };
+    });
+  };
+  const collectVideoIdsForDate = function (channels, targetDate) {
+    let includeAllActives = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : false;
+    const ids = new Set();
+    if (!Array.isArray(channels)) return [];
+    for (let i = 0; i < channels.length; i++) {
+      const ch = channels[i];
+      const buckets = [ch.Actives, ch.Upcoming, ch.Past];
+      if (includeAllActives && ch.Actives) {
+        Object.values(ch.Actives).forEach(v => {
+          if (v && v.VideoId) ids.add(v.VideoId);
+        });
+      }
+      if (targetDate) {
+        buckets.forEach(bucket => {
+          if (!bucket) return;
+          Object.values(bucket).forEach(v => {
+            if (!v || !v.VideoId) return;
+            const dateStr = v.EffectiveStartTime || getEffectiveDateString(v);
+            if (!dateStr) return;
+            const d = new Date(dateStr);
+            if (!isNaN(d.getTime()) && isSameLocalDay(d, targetDate)) {
+              ids.add(v.VideoId);
+            }
+          });
+        });
+      }
+    }
+    return Array.from(ids);
+  };
+  const ensureDateChannelsValidated = async (channels, targetDate) => {
+    if (!Array.isArray(channels) || channels.length === 0 || !targetDate) {
+      return {
+        channels,
+        removedCount: 0
+      };
+    }
+    const dayKey = toDayKey(targetDate);
+    const ids = collectVideoIdsForDate(channels, targetDate, false);
+    const unverified = ids.filter(id => !verifiedVideoIds.has(id) && !deletedVideoIds.has(id));
+    if (unverified.length === 0) {
+      validatedDayKeys.add(dayKey);
+      return {
+        channels: purgeDeletedFromChannels(channels),
+        removedCount: 0
+      };
+    }
+    const removedCount = await probeVideoBatch(unverified, 24, 2000);
+    validatedDayKeys.add(dayKey);
+    return {
+      channels: purgeDeletedFromChannels(channels),
+      removedCount
+    };
+  };
+  const isDatePrevalidated = targetDate => {
+    if (!targetDate) return true;
+    return validatedDayKeys.has(toDayKey(targetDate));
+  };
+
+  /**
+   * Pre-valida silenciosamente en segundo plano todos los días restantes (-7 a +7)
+   * para que al cambiar de día en la grilla los borrados ya estén aplicados sin espera.
+   */
+  const prevalidateAllScheduleChannels = async (channels, onUpdated) => {
+    if (!Array.isArray(channels) || channels.length === 0) return;
+    const allIds = new Set();
+    channels.forEach(ch => {
+      [ch.Actives, ch.Upcoming, ch.Past].forEach(bucket => {
+        if (!bucket) return;
+        Object.values(bucket).forEach(v => {
+          if (v && v.VideoId && !verifiedVideoIds.has(v.VideoId) && !deletedVideoIds.has(v.VideoId)) {
+            allIds.add(v.VideoId);
+          }
+        });
+      });
+    });
+    const queue = Array.from(allIds);
+    if (queue.length === 0) return;
+    const chunkSize = 20;
+    let totalRemoved = 0;
+    for (let i = 0; i < queue.length; i += chunkSize) {
+      const slice = queue.slice(i, i + chunkSize);
+      const removed = await probeVideoBatch(slice, 12, 2200);
+      totalRemoved += removed;
+      // Pequeña pausa entre tandas para mantener 60fps en la navegación con control remoto
+      await new Promise(r => setTimeout(r, 30));
+    }
+    if (totalRemoved > 0 && typeof onUpdated === 'function') {
+      onUpdated(purgeDeletedFromChannels(channels));
+    }
+  };
+  const getChannels = async function () {
+    let options = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : {};
+    const _options$forceRefresh = options.forceRefresh,
+      forceRefresh = _options$forceRefresh === void 0 ? false : _options$forceRefresh;
+    if (forceRefresh) {
+      verifiedVideoIds.clear();
+      validatedDayKeys.clear();
+    }
+    try {
       const response = await fetch(API_URL$1);
       if (!response.ok) {
         throw new Error("Error HTTP: ".concat(response.status, " - ").concat(response.statusText));
       }
       const data = await response.json();
-      if (!data) {
+      if (!Array.isArray(data)) {
         return [];
       }
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      const minTime = today.getTime() - SCHEDULE_WINDOW_DAYS * DAY_MS;
+      const maxTime = today.getTime() + (SCHEDULE_WINDOW_DAYS + 1) * DAY_MS;
 
-      // Recorremos los canales y filtramos los videos internos con ToBeCut = true
-      return data.map(channel => {
-        const filterVideos = videos => {
-          if (!videos) return videos;
-          // Soportar tanto arrays como diccionarios (objetos)
-          if (Array.isArray(videos)) {
-            return videos.filter(v => v.ToBeCut !== true);
-          }
-          const result = {};
-          Object.keys(videos).forEach(key => {
-            if (videos[key].ToBeCut !== true) {
-              result[key] = videos[key];
-            }
-          });
-          return result;
-        };
-        return {
-          ...channel,
-          Actives: filterVideos(channel.Actives),
-          Upcoming: filterVideos(channel.Upcoming),
-          Past: filterVideos(channel.Past)
-        };
-      });
-    } catch (error) {
-      console.error("Error al obtener los canales:", error);
-      throw error;
+      // 1. Limpieza sincrónica estructural (ToBeCut, IDs vacíos, duplicados y ventana de fechas)
+      const sanitized = data.filter(ch => ch && ch.ChannelName).map(ch => buildCleanChannel(ch, minTime, maxTime));
+
+      // 2. Pre-validación ANTES del renderizado para transmisiones en vivo + grilla de Hoy
+      const priorityIds = collectVideoIdsForDate(sanitized, today, true);
+      await probeVideoBatch(priorityIds, 24, 2200);
+      validatedDayKeys.add(toDayKey(today));
+      return purgeDeletedFromChannels(sanitized);
+    } catch (err) {
+      console.error('Error al obtener los canales:', err);
+      throw err;
     }
   };
 
@@ -6738,95 +7057,112 @@ var APP_com_domain_app_ZappingStream = (function () {
         provinces: provinces.sort()
       };
     } catch (error) {
-      console.error("Error al obtener las provincias:", error);
+      console.error('Error al obtener las provincias:', error);
       throw error;
     }
   };
 
   // ============================================
-  // Paleta de Colores Global (adaptada de CSS)
+  // Paleta de Colores Smart TV (Estilo Netflix)
   // ============================================
   const COLORS = {
-    // Fondos
-    BG_BLACK: 0xff000000,
-    // #000
-    BG_DARK: 0xff111111,
-    // #111
-    BG_PANEL: 0xff222222,
-    // #222
+    TRANSPARENT: 0x00000000,
+    // Fondos cinematográficos de alto contraste para TV
+    BG_BLACK: 0xff0a0a0c,
+    BG_CANVAS: 0xff141414,
+    // Fondo principal Netflix (#141414)
+    BG_DARK: 0xff18181c,
+    // Superficie de tarjetas
+    BG_CARD: 0xff1c1c22,
+    // Tarjeta en reposo
+    BG_PANEL: 0xff26262e,
+    // Píldoras y botones secundarios
+    BG_ELEVATED: 0xff32323d,
+    // Superficie elevada
 
-    // Textos
+    // Textos calibrados para lectura a 3 metros (10-foot UI)
     TEXT_WHITE: 0xffffffff,
-    // #fff
-    TEXT_GRAY: 0xff888888,
-    // #888 (inactivo)
-
-    // Acentos
+    TEXT_LIGHT: 0xffe5e5e5,
+    // Títulos de filas estilo Netflix
+    TEXT_GRAY: 0xffa3a3a3,
+    // Subtítulos y metadatos
+    TEXT_MUTED: 0xff737373,
+    // Acentos Netflix + Identidad Zapping
+    NETFLIX_RED: 0xffe50914,
+    // Rojo principal Netflix / En Vivo
+    NETFLIX_RED_DARK: 0xffb20710,
+    FOCUS_WHITE: 0xffffffff,
+    // Anillo y foco principal de alto contraste en TV
     ACCENT_BLUE: 0xff38b6ff,
-    // #38B6FF (azul principal)
-    ACCENT_BLUE_HOVER: 0xff0a30b4,
-    // #0a30b4 (azul oscuro hover)
+    // Acento secundario de marca
 
-    // Badges
-    LIVE_BADGE: 0xffcc0000,
-    // rgba(204, 0, 0, 0.9) - Rojo para Live
-    PREMIERE_BADGE: 0xff4d68ff,
-    // #4d68ff - Azul para Premiere
-
-    // Bordes
-    BORDER_LIGHT: 0xff444444,
-    // #444
-    BORDER_DARK: 0xff333333,
-    // #333
-    BORDER_DISABLED: 0xff555555 // #555 (deshabilitado)
+    // Badges de estado
+    LIVE_BADGE: 0xffe50914,
+    PREMIERE_BADGE: 0xff2563eb,
+    // Bordes y divisores
+    BORDER_LIGHT: 0xff3f3f46,
+    BORDER_DARK: 0xff27272a,
+    BORDER_DISABLED: 0xff52525b
   };
 
   // ============================================
-  // Valores tipográficos
+  // Escala tipográfica 10-foot UI (1920x1080)
   // ============================================
   const TYPOGRAPHY = {
     FONT_FAMILY: 'Regular',
-    // Lightning usa fuentes registradas
-    FONT_SIZE_SMALL: 14,
-    FONT_SIZE_NORMAL: 16,
-    FONT_SIZE_LARGE: 18,
-    FONT_SIZE_XLARGE: 32
+    FONT_SIZE_XS: 16,
+    FONT_SIZE_SMALL: 19,
+    FONT_SIZE_NORMAL: 22,
+    FONT_SIZE_LARGE: 26,
+    FONT_SIZE_XLARGE: 36,
+    FONT_SIZE_HERO: 46
   };
 
   // ============================================
-  // Radii de bordes
+  // Radios de bordes
   // ============================================
   const BORDER_RADIUS = {
     SMALL: 4,
-    MEDIUM: 8,
-    LARGE: 12,
-    PILL: 20,
+    MEDIUM: 6,
+    LARGE: 10,
+    PILL: 26,
     CIRCLE: 50
+  };
+
+  // ============================================
+  // Espaciado TV (incluye margen seguro / overscan)
+  // ============================================
+  const SPACING = {
+    SAFE_X: 64,
+    SAFE_Y: 40,
+    GAP_SMALL: 8,
+    GAP_MEDIUM: 16,
+    GAP_LARGE: 24,
+    GAP_XLARGE: 32,
+    PADDING_SMALL: 8,
+    PADDING_MEDIUM: 14,
+    PADDING_LARGE: 24
   };
 
   // ============================================
   // Tamaños de componentes
   // ============================================
   const COMPONENT_SIZE = {
-    // Botones
-    BUTTON_HEIGHT: 50,
-    BUTTON_HEIGHT_SMALL: 36,
-    // Cards
-    CARD_WIDTH: 240,
-    CARD_HEIGHT: 250,
-    // Logos/Avatares
-    LOGO_SMALL: 50,
-    LOGO_MEDIUM: 80,
-    // Scroll Arrows
+    BUTTON_HEIGHT: 52,
+    BUTTON_HEIGHT_SMALL: 38,
+    CARD_WIDTH: 340,
+    CARD_HEIGHT: 248,
+    LOGO_SMALL: 36,
+    LOGO_MEDIUM: 68,
     ARROW_SIZE: 44
   };
 
-  // Sub-componente interno que simula ser un botón, input o select
-  class HeaderButton extends Lightning$1.Component {
+  class NavPill extends Lightning$1.Component {
     static _template() {
       return {
+        h: 50,
         rect: true,
-        color: COLORS.BG_PANEL,
+        color: COLORS.TRANSPARENT,
         shader: {
           type: Lightning$1.shaders.RoundedRectangle,
           radius: BORDER_RADIUS.MEDIUM
@@ -6837,67 +7173,96 @@ var APP_com_domain_app_ZappingStream = (function () {
             text: '',
             fontSize: TYPOGRAPHY.FONT_SIZE_NORMAL,
             fontFace: TYPOGRAPHY.FONT_FAMILY,
-            textColor: COLORS.TEXT_WHITE,
+            textColor: COLORS.TEXT_LIGHT,
+            maxLines: 1,
             textOverflow: 'ellipsis'
           }
+        },
+        ActiveBar: {
+          alpha: 0,
+          rect: true,
+          h: 4,
+          y: 46,
+          color: COLORS.NETFLIX_RED
         }
       };
+    }
+    _init() {
+      this._syncGeometry();
+      this._updateAppearance();
+    }
+    _syncGeometry() {
+      const width = this.w || 160;
+      this.tag('Label').patch({
+        x: width / 2,
+        y: 26,
+        text: {
+          wordWrapWidth: width > 24 ? width - 24 : width
+        }
+      });
+      this.tag('ActiveBar').patch({
+        x: Math.round(width * 0.18),
+        w: Math.round(width * 0.64)
+      });
     }
     set label(v) {
       this.tag('Label').text.text = v;
     }
-    _init() {
-      // Asignamos las medidas de forma segura una vez que el componente existe
-      this.tag('Label').patch({
-        x: this.w / 2,
-        y: this.h / 2 + 2,
-        text: {
-          wordWrapWidth: this.w > 20 ? this.w - 20 : 0
-        }
-      });
+    set variant(v) {
+      this._variant = v; // 'tab' | 'filter' | 'action'
+      this._updateAppearance();
     }
     set isActive(v) {
-      this._isActiveFlag = v;
+      this._isActiveFlag = Boolean(v);
       this._updateAppearance();
     }
     _updateAppearance() {
-      if (this.hasFocus()) {
+      const focused = this.hasFocus();
+      const isTab = this._variant === 'tab';
+      if (focused) {
         this.patch({
-          color: COLORS.ACCENT_BLUE,
+          color: COLORS.FOCUS_WHITE,
           Label: {
             text: {
-              textColor: COLORS.BG_BLACK
+              textColor: COLORS.BG_BLACK,
+              fontStyle: 'bold'
             }
           },
-          smooth: {
-            scale: 1.05
+          ActiveBar: {
+            alpha: this._isActiveFlag && isTab ? 1 : 0
           }
         });
-      } else if (this._isActiveFlag) {
-        this.patch({
-          color: COLORS.BORDER_LIGHT,
-          Label: {
-            text: {
-              textColor: COLORS.ACCENT_BLUE
-            }
-          },
-          smooth: {
-            scale: 1.0
-          }
-        });
-      } else {
-        this.patch({
-          color: COLORS.BG_PANEL,
-          Label: {
-            text: {
-              textColor: COLORS.TEXT_WHITE
-            }
-          },
-          smooth: {
-            scale: 1.0
-          }
-        });
+        return;
       }
+      if (isTab) {
+        this.patch({
+          color: COLORS.TRANSPARENT,
+          Label: {
+            text: {
+              textColor: this._isActiveFlag ? COLORS.TEXT_WHITE : COLORS.TEXT_GRAY,
+              fontStyle: this._isActiveFlag ? 'bold' : 'normal'
+            }
+          },
+          ActiveBar: {
+            alpha: this._isActiveFlag ? 1 : 0
+          }
+        });
+        return;
+      }
+
+      // Filtros y acciones rápidas
+      this.patch({
+        color: this._isActiveFlag ? 0xff2c1215 : COLORS.BG_PANEL,
+        Label: {
+          text: {
+            textColor: this._isActiveFlag ? COLORS.TEXT_WHITE : COLORS.TEXT_LIGHT,
+            fontStyle: this._isActiveFlag ? 'bold' : 'normal'
+          }
+        },
+        ActiveBar: {
+          alpha: this._isActiveFlag ? 1 : 0
+        }
+      });
     }
     _focus() {
       this._updateAppearance();
@@ -6905,113 +7270,146 @@ var APP_com_domain_app_ZappingStream = (function () {
     _unfocus() {
       this._updateAppearance();
     }
-
-    // Al presionar Enter, avisa al padre (AppHeader) qué botón fue presionado
     _handleEnter() {
       this.fireAncestors('$onHeaderAction', this.ref);
+      return true;
     }
   }
   class AppHeader extends Lightning$1.Component {
     static _template() {
       return {
         w: 1920,
-        h: 220,
-        rect: true,
-        color: COLORS.TRANSPARENT,
+        h: 96,
+        Backdrop: {
+          w: 1920,
+          h: 96,
+          rect: true,
+          color: 0xf20e0e12
+        },
+        BottomHairline: {
+          y: 95,
+          w: 1920,
+          h: 1,
+          rect: true,
+          color: 0x22ffffff
+        },
         Logo: {
-          x: 60,
-          y: 0,
-          w: 220,
-          h: 220,
+          x: 64,
+          y: 10,
+          w: 124,
+          h: 76,
           src: Utils.asset('images/logo.png')
         },
-        // Controles de navegación de cabecera alineados horizontalmente
         Controls: {
-          x: 350,
-          y: 30,
-          Search: {
-            type: HeaderButton,
-            ref: 'Search',
-            w: 260,
-            h: 60
-          },
-          Province: {
-            type: HeaderButton,
-            ref: 'Province',
-            x: 280,
-            w: 240,
-            h: 60
-          },
-          City: {
-            type: HeaderButton,
-            ref: 'City',
-            x: 540,
-            w: 240,
-            h: 60
-          },
+          x: 0,
+          y: 23,
           ModeCards: {
-            type: HeaderButton,
+            type: NavPill,
             ref: 'ModeCards',
-            x: 800,
-            w: 160,
-            h: 60
+            x: 216,
+            w: 132,
+            variant: 'tab'
           },
           ModeGrid: {
-            type: HeaderButton,
+            type: NavPill,
             ref: 'ModeGrid',
-            x: 980,
-            w: 220,
-            h: 60
+            x: 358,
+            w: 214,
+            variant: 'tab'
+          },
+          Sep1: {
+            x: 588,
+            y: 11,
+            w: 1,
+            h: 28,
+            rect: true,
+            color: 0x33ffffff
+          },
+          Search: {
+            type: NavPill,
+            ref: 'Search',
+            x: 608,
+            w: 256,
+            variant: 'filter'
+          },
+          Province: {
+            type: NavPill,
+            ref: 'Province',
+            x: 878,
+            w: 266,
+            variant: 'filter'
+          },
+          City: {
+            type: NavPill,
+            ref: 'City',
+            x: 1158,
+            w: 252,
+            variant: 'filter'
+          },
+          Refresh: {
+            type: NavPill,
+            ref: 'Refresh',
+            x: 1506,
+            w: 190,
+            variant: 'action'
+          },
+          Info: {
+            type: NavPill,
+            ref: 'Info',
+            x: 1710,
+            w: 146,
+            variant: 'action'
           }
         }
       };
     }
     _construct() {
-      this._index = 0; // Índice de foco horizontal
-      this._controls = ['Search', 'Province', 'City', 'ModeCards', 'ModeGrid'];
+      this._index = 0;
+      this._controls = ['ModeCards', 'ModeGrid', 'Search', 'Province', 'City', 'Refresh', 'Info'];
+      this._hasCities = true;
+      this._isRefreshing = false;
     }
-
-    // Equivalente a recibir los "props" de React
     set config(data) {
       const searchText = data.searchText,
         viewMode = data.viewMode,
         selectedProvince = data.selectedProvince,
-        selectedCity = data.selectedCity;
-        data.provinces;
-        const cities = data.cities,
+        selectedCity = data.selectedCity,
+        cities = data.cities,
+        isRefreshing = data.isRefreshing,
         callbacks = data.callbacks;
       this._callbacks = callbacks || {};
-      this.tag('Controls.Search').label = searchText ? "\uD83D\uDD0D ".concat(searchText) : '🔍 Buscar canal...';
-      this.tag('Controls.Province').label = selectedProvince ? "Prov: ".concat(selectedProvince) : 'Provincia: Todas';
-      this.tag('Controls.City').label = selectedCity ? "Ciudad: ".concat(selectedCity) : 'Ciudad: Todas';
-
-      // Deshabilitar visualmente o no la ciudad si el arreglo está vacío
-      this._hasCities = cities && cities.length > 0;
-      this.tag('Controls.City').alpha = this._hasCities ? 1 : 0.5;
-      this.tag('Controls.ModeCards').label = 'Canales';
+      this._isRefreshing = Boolean(isRefreshing);
+      this.tag('Controls.ModeCards').label = 'Inicio';
       this.tag('Controls.ModeCards').isActive = viewMode === 'cards';
       this.tag('Controls.ModeGrid').label = 'Transmisiones';
       this.tag('Controls.ModeGrid').isActive = viewMode === 'grid';
+      this.tag('Controls.Search').label = searchText ? "\uD83D\uDD0D \"".concat(searchText, "\"") : '🔍 Buscar';
+      this.tag('Controls.Search').isActive = Boolean(searchText);
+      this.tag('Controls.Province').label = selectedProvince ? "\uD83D\uDCCD ".concat(selectedProvince) : 'Provincia: Todas';
+      this.tag('Controls.Province').isActive = Boolean(selectedProvince);
+      this.tag('Controls.City').label = selectedCity ? "\uD83D\uDCCD ".concat(selectedCity) : 'Ciudad: Todas';
+      this.tag('Controls.City').isActive = Boolean(selectedCity);
+      this._hasCities = Boolean(cities && cities.length > 0);
+      this.tag('Controls.City').alpha = this._hasCities ? 1 : 0.4;
+      this.tag('Controls.Refresh').label = this._isRefreshing ? '↻ Cargando...' : '↻ Actualizar';
+      this.tag('Controls.Refresh').alpha = this._isRefreshing ? 0.55 : 1;
+      this.tag('Controls.Info').label = 'ℹ Info';
     }
-
-    // --- Manejo del Foco Horizontal ---
     _handleLeft() {
       if (this._index > 0) {
         this._index--;
-        // Si estamos retrocediendo y "City" está deshabilitado, lo saltamos
-        if (this._controls[this._index] === 'City' && !this._hasCities) {
+        if (this._controls[this._index] === 'City' && !this._hasCities && this._index > 0) {
           this._index--;
         }
         this._refocus();
         return true;
       }
-      return false; // Permite que el contenedor superior atrape la flecha izquierda si hiciera falta
+      return false;
     }
     _handleRight() {
       if (this._index < this._controls.length - 1) {
         this._index++;
-        // Si avanzamos y "City" está deshabilitado, lo saltamos
-        if (this._controls[this._index] === 'City' && !this._hasCities) {
+        if (this._controls[this._index] === 'City' && !this._hasCities && this._index < this._controls.length - 1) {
           this._index++;
         }
         this._refocus();
@@ -7019,17 +7417,19 @@ var APP_com_domain_app_ZappingStream = (function () {
       }
       return false;
     }
-
-    // Le dice a Lightning JS a qué control darle el estado _focus()
     _getFocused() {
       const controlRef = this._controls[this._index];
       return this.tag("Controls.".concat(controlRef));
     }
-
-    // --- Receptor de Eventos (Simulación de onClick) ---
     $onHeaderAction(ref) {
       if (!this._callbacks) return;
       switch (ref) {
+        case 'ModeCards':
+          if (this._callbacks.onViewModeChange) this._callbacks.onViewModeChange('cards');
+          break;
+        case 'ModeGrid':
+          if (this._callbacks.onViewModeChange) this._callbacks.onViewModeChange('grid');
+          break;
         case 'Search':
           if (this._callbacks.onSearchClick) this._callbacks.onSearchClick();
           break;
@@ -7039,189 +7439,399 @@ var APP_com_domain_app_ZappingStream = (function () {
         case 'City':
           if (this._hasCities && this._callbacks.onCityClick) this._callbacks.onCityClick();
           break;
-        case 'ModeCards':
-          if (this._callbacks.onViewModeChange) this._callbacks.onViewModeChange('cards');
+        case 'Refresh':
+          if (!this._isRefreshing && this._callbacks.onRefresh) this._callbacks.onRefresh();
           break;
-        case 'ModeGrid':
-          if (this._callbacks.onViewModeChange) this._callbacks.onViewModeChange('grid');
+        case 'Info':
+          if (this._callbacks.onShowInfo) this._callbacks.onShowInfo();
           break;
       }
     }
   }
 
-  // Sub-componente interno para los botones del footer
-  class FooterButton extends Lightning$1.Component {
-    static _template() {
-      return {
-        w: 260,
-        h: 60,
-        rect: true,
-        color: 0x00000000,
-        // Transparente por defecto
-        shader: {
-          type: Lightning$1.shaders.RoundedRectangle,
-          radius: BORDER_RADIUS.PILL
-        },
-        Icon: {
-          mount: 0.5,
-          x: 50,
-          y: 30,
-          text: {
-            text: '',
-            fontSize: 26,
-            fontFace: TYPOGRAPHY.FONT_FAMILY,
-            textColor: COLORS.TEXT_WHITE
-          }
-        },
-        Label: {
-          mountY: 0.5,
-          x: 80,
-          y: 32,
-          text: {
-            text: '',
-            fontSize: TYPOGRAPHY.FONT_SIZE_LARGE,
-            fontFace: TYPOGRAPHY.FONT_FAMILY,
-            textColor: COLORS.TEXT_WHITE
-          }
-        }
-      };
-    }
-    set label(v) {
-      this.tag('Label').text.text = v;
-    }
-    set icon(v) {
-      this.tag('Icon').text.text = v;
-    }
-    set centerLabel(v) {
-      if (v) {
-        this.tag('Label').patch({
-          x: 130,
-          mountX: 0.5
-        });
-      }
-    }
-    _focus() {
-      this.patch({
-        color: COLORS.BG_PANEL,
-        Label: {
-          text: {
-            textColor: COLORS.ACCENT_BLUE
-          }
-        },
-        Icon: {
-          text: {
-            textColor: COLORS.ACCENT_BLUE
-          }
-        }
-      });
-    }
-    _unfocus() {
-      this.patch({
-        color: 0x00000000,
-        Label: {
-          text: {
-            textColor: COLORS.TEXT_WHITE
-          }
-        },
-        Icon: {
-          text: {
-            textColor: COLORS.TEXT_WHITE
-          }
-        }
-      });
-    }
-    _handleEnter() {
-      this.fireAncestors('$onFooterAction', this.ref);
-    }
-  }
   class AppFooter extends Lightning$1.Component {
     static _template() {
       return {
-        w: 560,
-        h: 80,
+        w: 1920,
+        h: 48,
         rect: true,
-        color: COLORS.BG_BLACK,
-        shader: {
-          type: Lightning$1.shaders.RoundedRectangle,
-          radius: BORDER_RADIUS.PILL
-        },
-        RefreshBtn: {
-          type: FooterButton,
-          ref: 'RefreshBtn',
-          x: 10,
-          y: 10,
-          label: 'Actualizar',
-          icon: '↻'
-        },
-        Divider: {
+        color: 0xeb0b0b0e,
+        TopLine: {
+          w: 1920,
+          h: 1,
           rect: true,
-          w: 2,
-          h: 40,
-          x: 280,
-          y: 20,
-          color: COLORS.BORDER_LIGHT
+          color: 0x1fffffff
         },
-        InfoBtn: {
-          type: FooterButton,
-          ref: 'InfoBtn',
-          x: 290,
-          y: 10,
-          label: 'Info / Contacto',
-          centerLabel: true
+        Hints: {
+          x: 64,
+          y: 25,
+          mountY: 0.5,
+          text: {
+            text: 'OK  Seleccionar     •     ◀ ▶ ▲ ▼  Navegar     •     ↩ ATRÁS  Menú superior',
+            fontSize: 18,
+            fontFace: TYPOGRAPHY.FONT_FAMILY,
+            textColor: COLORS.TEXT_GRAY
+          }
+        },
+        Stats: {
+          x: 1856,
+          y: 25,
+          mountX: 1,
+          mountY: 0.5,
+          text: {
+            text: '',
+            fontSize: 18,
+            fontFace: TYPOGRAPHY.FONT_FAMILY,
+            textColor: COLORS.TEXT_MUTED
+          }
         }
       };
     }
-    _construct() {
-      this._index = 0;
-      this._buttons = ['RefreshBtn', 'InfoBtn'];
-    }
-    _init() {}
-
-    // Equivalente a tus props
     set config(data) {
-      const onRefresh = data.onRefresh,
-        isRefreshing = data.isRefreshing,
-        onShowInfo = data.onShowInfo;
-      this._onRefresh = onRefresh;
-      this._onShowInfo = onShowInfo;
-      this._isRefreshing = isRefreshing;
-
-      // Manejar el estado del botón Refresh
-      if (isRefreshing) {
-        this.tag('RefreshBtn').alpha = 0.5; // Lo mostramos visualmente "deshabilitado"
+      if (!data) return;
+      const viewMode = data.viewMode,
+        _data$liveCount = data.liveCount,
+        liveCount = _data$liveCount === void 0 ? 0 : _data$liveCount,
+        _data$totalCount = data.totalCount,
+        totalCount = _data$totalCount === void 0 ? 0 : _data$totalCount,
+        _data$isRefreshing = data.isRefreshing,
+        isRefreshing = _data$isRefreshing === void 0 ? false : _data$isRefreshing;
+      if (viewMode === 'grid') {
+        this.tag('Hints').text.text = 'OK  Ver transmisión / Info canal     •     ◀ ▶  Cambiar horario o día     •     ▲ ▼  Cambiar canal     •     ↩ ATRÁS  Menú';
       } else {
-        this.tag('RefreshBtn').alpha = 1;
+        this.tag('Hints').text.text = 'OK  Ver transmisión     •     ◀ ▶ ▲ ▼  Explorar catálogo     •     ↩ ATRÁS  Menú superior';
+      }
+      if (isRefreshing) {
+        this.tag('Stats').text.text = 'Actualizando programación...';
+      } else if (totalCount > 0) {
+        this.tag('Stats').text.text = "".concat(liveCount, " en vivo  \u2022  ").concat(totalCount, " canales");
+      } else {
+        this.tag('Stats').text.text = '';
       }
     }
+  }
 
-    // --- Navegación del Control Remoto ---
-    _handleLeft() {
-      if (this._index > 0) {
-        this._index--;
-        this._refocus();
-        return true;
+  class HeroBanner extends Lightning$1.Component {
+    static _template() {
+      return {
+        w: 1920,
+        h: 350,
+        clipping: true,
+        BaseBg: {
+          w: 1920,
+          h: 350,
+          rect: true,
+          color: COLORS.BG_CANVAS
+        },
+        ArtworkWrap: {
+          x: 840,
+          y: 0,
+          w: 1080,
+          h: 350,
+          clipping: true,
+          Backdrop: {
+            x: 0,
+            y: -80,
+            w: 1080,
+            h: 540,
+            alpha: 0
+          },
+          LeftGradient: {
+            x: 0,
+            y: 0,
+            w: 520,
+            h: 350,
+            rect: true,
+            colorLeft: COLORS.BG_CANVAS,
+            colorRight: 0x00141414
+          },
+          RightGradient: {
+            x: 900,
+            y: 0,
+            w: 180,
+            h: 350,
+            rect: true,
+            colorLeft: 0x00141414,
+            colorRight: 0xc0141414
+          },
+          TopGradient: {
+            x: 0,
+            y: 0,
+            w: 1080,
+            h: 70,
+            rect: true,
+            colorTop: 0xd9141414,
+            colorBottom: 0x00141414
+          },
+          BottomGradient: {
+            x: 0,
+            y: 220,
+            w: 1080,
+            h: 130,
+            rect: true,
+            colorTop: 0x00141414,
+            colorBottom: COLORS.BG_CANVAS
+          }
+        },
+        Info: {
+          x: 64,
+          y: 22,
+          StatusBadge: {
+            h: 30,
+            w: 140,
+            rect: true,
+            color: COLORS.NETFLIX_RED,
+            shader: {
+              type: Lightning$1.shaders.RoundedRectangle,
+              radius: BORDER_RADIUS.SMALL
+            },
+            Label: {
+              mount: 0.5,
+              x: 70,
+              y: 16,
+              text: {
+                text: 'EN VIVO',
+                fontSize: 16,
+                fontStyle: 'bold',
+                fontFace: TYPOGRAPHY.FONT_FAMILY,
+                textColor: COLORS.TEXT_WHITE
+              }
+            }
+          },
+          MetaText: {
+            x: 156,
+            y: 4,
+            text: {
+              text: '',
+              fontSize: 20,
+              fontFace: TYPOGRAPHY.FONT_FAMILY,
+              textColor: COLORS.TEXT_GRAY,
+              maxLines: 1,
+              wordWrapWidth: 740,
+              textOverflow: 'ellipsis'
+            }
+          },
+          Avatar: {
+            x: 0,
+            y: 46,
+            w: 48,
+            h: 48,
+            alpha: 0,
+            shader: {
+              type: Lightning$1.shaders.RoundedRectangle,
+              radius: 24
+            }
+          },
+          ChannelName: {
+            x: 0,
+            y: 42,
+            text: {
+              text: '',
+              fontSize: TYPOGRAPHY.FONT_SIZE_HERO,
+              fontStyle: 'bold',
+              fontFace: TYPOGRAPHY.FONT_FAMILY,
+              textColor: COLORS.TEXT_WHITE,
+              maxLines: 1,
+              wordWrapWidth: 860,
+              textOverflow: 'ellipsis'
+            }
+          },
+          Headline: {
+            x: 0,
+            y: 108,
+            text: {
+              text: '',
+              fontSize: 26,
+              fontStyle: 'bold',
+              fontFace: TYPOGRAPHY.FONT_FAMILY,
+              textColor: COLORS.TEXT_LIGHT,
+              maxLines: 2,
+              wordWrapWidth: 880,
+              lineHeight: 34,
+              textOverflow: 'ellipsis'
+            }
+          },
+          Description: {
+            x: 0,
+            y: 184,
+            text: {
+              text: '',
+              fontSize: 20,
+              fontFace: TYPOGRAPHY.FONT_FAMILY,
+              textColor: COLORS.TEXT_GRAY,
+              maxLines: 2,
+              wordWrapWidth: 860,
+              lineHeight: 28,
+              textOverflow: 'ellipsis'
+            }
+          },
+          CtaHint: {
+            x: 0,
+            y: 256,
+            h: 44,
+            w: 380,
+            rect: true,
+            color: 0x24ffffff,
+            shader: {
+              type: Lightning$1.shaders.RoundedRectangle,
+              radius: BORDER_RADIUS.MEDIUM
+            },
+            Label: {
+              mountY: 0.5,
+              x: 18,
+              y: 23,
+              text: {
+                text: '▶  Presioná OK para reproducir',
+                fontSize: 20,
+                fontStyle: 'bold',
+                fontFace: TYPOGRAPHY.FONT_FAMILY,
+                textColor: COLORS.TEXT_WHITE
+              }
+            }
+          }
+        }
+      };
+    }
+    _init() {
+      this._backdropTimer = null;
+      this._currentBackdropSrc = '';
+      this.tag('ArtworkWrap.Backdrop').on('txLoaded', () => {
+        this.tag('ArtworkWrap.Backdrop').patch({
+          smooth: {
+            alpha: 0.85
+          }
+        });
+      });
+      this.tag('ArtworkWrap.Backdrop').on('txError', () => {
+        this.tag('ArtworkWrap.Backdrop').alpha = 0;
+      });
+      this.tag('Info.Avatar').on('txLoaded', () => {
+        this.tag('Info.Avatar').alpha = 1;
+      });
+      this.tag('Info.Avatar').on('txError', () => {
+        this.tag('Info.Avatar').alpha = 0;
+      });
+    }
+    _detach() {
+      if (this._backdropTimer) {
+        clearTimeout(this._backdropTimer);
+        this._backdropTimer = null;
       }
-      return false;
     }
-    _handleRight() {
-      if (this._index < this._buttons.length - 1) {
-        this._index++;
-        this._refocus();
-        return true;
+    set featured(data) {
+      if (!data || !data.channel) {
+        this.alpha = 0;
+        return;
       }
-      return false;
-    }
-    _getFocused() {
-      return this.tag(this._buttons[this._index]);
-    }
+      this.alpha = 1;
+      const channel = data.channel,
+        _data$provinceName = data.provinceName,
+        provinceName = _data$provinceName === void 0 ? '' : _data$provinceName;
+      const actives = channel.ActiveList || Object.values(channel.Actives || {});
+      const mainActive = actives.length > 0 ? actives[0] : null;
+      const isLive = Boolean(mainActive);
+      const isPremiere = Boolean(mainActive && mainActive.IsPremiere);
 
-    // --- Manejo de clics (Eventos) ---
-    $onFooterAction(ref) {
-      if (ref === 'RefreshBtn' && !this._isRefreshing) {
-        if (this._onRefresh) this._onRefresh();
-      } else if (ref === 'InfoBtn') {
-        if (this._onShowInfo) this._onShowInfo();
+      // 1. Badge de estado
+      let badgeText = 'ON DEMAND';
+      let badgeColor = COLORS.BG_ELEVATED;
+      let badgeW = 144;
+      if (isLive) {
+        badgeText = isPremiere ? '★ ESTRENO' : '● EN VIVO';
+        badgeColor = isPremiere ? COLORS.PREMIERE_BADGE : COLORS.NETFLIX_RED;
+        badgeW = isPremiere ? 136 : 128;
       }
+      this.tag('Info.StatusBadge').patch({
+        w: badgeW,
+        color: badgeColor,
+        Label: {
+          x: badgeW / 2,
+          text: {
+            text: badgeText
+          }
+        }
+      });
+
+      // 2. Línea de ubicación y cantidad de señales
+      const metaParts = [];
+      if (channel.ChannelCity) {
+        metaParts.push(provinceName && provinceName !== channel.ChannelCity ? "".concat(channel.ChannelCity, ", ").concat(provinceName) : channel.ChannelCity);
+      }
+      if (actives.length > 1) {
+        metaParts.push("".concat(actives.length, " transmisiones en simult\xE1neo"));
+      } else if (!isLive) {
+        const upcomingCount = channel.Upcoming ? Object.keys(channel.Upcoming).length : 0;
+        if (upcomingCount > 0) {
+          metaParts.push("".concat(upcomingCount, " pr\xF3ximas en gu\xEDa"));
+        }
+      }
+      this.tag('Info.MetaText').patch({
+        x: badgeW + 16,
+        text: {
+          text: metaParts.join('  •  ')
+        }
+      });
+
+      // 3. Avatar + Nombre del canal
+      const avatarUrl = channel.ChannelImgUrl ? getOptimizedImageUrl(channel.ChannelImgUrl, 120) : '';
+      if (avatarUrl) {
+        if (this._lastAvatarUrl !== avatarUrl) {
+          this._lastAvatarUrl = avatarUrl;
+          this.tag('Info.Avatar').alpha = 0.001;
+          this.tag('Info.Avatar').src = avatarUrl;
+        }
+        this.tag('Info.ChannelName').x = 62;
+      } else {
+        this._lastAvatarUrl = '';
+        this.tag('Info.Avatar').alpha = 0;
+        this.tag('Info.ChannelName').x = 0;
+      }
+      this.tag('Info.ChannelName').text.text = channel.ChannelName || '';
+
+      // 4. Título de transmisión actual y descripción
+      if (isLive) {
+        this.tag('Info.Headline').text.text = mainActive.Title || 'Transmisión en directo';
+        this.tag('Info.Description').text.text = channel.ChannelDescription || 'Señal de streaming en vivo.';
+      } else {
+        this.tag('Info.Headline').text.text = channel.ChannelDescription || 'Explorá los programas y emisiones recientes de este canal.';
+        this.tag('Info.Description').text.text = channel.ChannelCity ? "Canal de streaming desde ".concat(channel.ChannelCity, ".") : 'Disponible bajo demanda en YouTube.';
+      }
+
+      // 5. Indicador de acción (100% interno en la app)
+      let ctaText = '▶  OK para ver en vivo';
+      if (actives.length > 1) {
+        ctaText = "\u25B6  OK para elegir transmisi\xF3n (".concat(actives.length, ")");
+      } else if (!isLive) {
+        ctaText = '📅  OK para ver transmisiones del canal';
+      }
+      const ctaW = Math.max(290, ctaText.length * 11 + 36);
+      this.tag('Info.CtaHint').patch({
+        w: ctaW,
+        Label: {
+          text: {
+            text: ctaText
+          }
+        }
+      });
+
+      // 6. Imagen de fondo con debounce corto para no saturar WebGL al hacer scroll rápido
+      const rawBackdrop = mainActive && mainActive.ThumbnailUrl || (channel.ChannelBannerUrl ? "".concat(channel.ChannelBannerUrl, "=w1280-fcrop64=1,00005a57ffffa5a8-k-c0xffffffff-no-nd-rj") : channel.ChannelImgUrl || '');
+      const nextSrc = rawBackdrop ? getOptimizedImageUrl(rawBackdrop, 720, mainActive ? channel.LastActivityAt : '') : '';
+      if (this._backdropTimer) {
+        clearTimeout(this._backdropTimer);
+        this._backdropTimer = null;
+      }
+      if (!nextSrc) {
+        this._currentBackdropSrc = '';
+        this.tag('ArtworkWrap.Backdrop').alpha = 0;
+        return;
+      }
+      if (this._currentBackdropSrc === nextSrc) return;
+      this._backdropTimer = setTimeout(() => {
+        this._currentBackdropSrc = nextSrc;
+        this.tag('ArtworkWrap.Backdrop').alpha = 0.001;
+        this.tag('ArtworkWrap.Backdrop').src = nextSrc;
+      }, 90);
     }
   }
 
@@ -7229,50 +7839,75 @@ var APP_com_domain_app_ZappingStream = (function () {
     static _template() {
       return {
         w: 1920,
-        h: 1080,
+        h: 936,
         alpha: 0,
-        // Oculto por defecto (equivale a tu "return null")
-
         Container: {
           mount: 0.5,
           x: 960,
-          // Centro de la pantalla en X
-          y: 540,
-          // Centro de la pantalla en Y
-
-          Spinner: {
+          y: 440,
+          AccentBar: {
             mount: 0.5,
             x: 0,
-            y: -60,
-            alpha: 0,
-            // Si tienes un asset para el spinner, descomenta la siguiente línea:
-            // src: Utils.asset('images/spinner.png'),
-
-            // Mientras tanto, usamos un texto o icono temporal que girará
-            text: {
-              text: '↻',
-              fontSize: 64,
-              textAlign: 'center'
-            }
+            y: -48,
+            w: 64,
+            h: 6,
+            rect: true,
+            color: COLORS.NETFLIX_RED
           },
           Message: {
             mountX: 0.5,
             x: 0,
-            y: 20,
+            y: -16,
             text: {
               text: '',
-              fontSize: 32,
-              fontFace: 'Regular',
-              textColor: 0xffffffff,
+              fontSize: 30,
+              fontStyle: 'bold',
+              fontFace: TYPOGRAPHY.FONT_FAMILY,
+              textColor: COLORS.TEXT_WHITE,
+              textAlign: 'center'
+            }
+          },
+          SubMessage: {
+            mountX: 0.5,
+            x: 0,
+            y: 34,
+            text: {
+              text: '',
+              fontSize: 20,
+              fontFace: TYPOGRAPHY.FONT_FAMILY,
+              textColor: COLORS.TEXT_GRAY,
               textAlign: 'center'
             }
           }
         }
       };
     }
-    _init() {}
-
-    // Este setter equivale a recibir los "props" en React
+    _init() {
+      this._pulseAnim = this.tag('Container.AccentBar').animation({
+        duration: 1.1,
+        repeat: -1,
+        actions: [{
+          p: 'w',
+          v: {
+            0: 48,
+            0.5: 140,
+            1: 48
+          }
+        }, {
+          p: 'alpha',
+          v: {
+            0: 0.5,
+            0.5: 1,
+            1: 0.5
+          }
+        }]
+      });
+    }
+    _detach() {
+      if (this._pulseAnim) {
+        this._pulseAnim.stop();
+      }
+    }
     set status(data) {
       const isFetching = data.isFetching,
         isLoading = data.isLoading,
@@ -7280,22 +7915,29 @@ var APP_com_domain_app_ZappingStream = (function () {
         hasFilteredChannels = data.hasFilteredChannels,
         searchText = data.searchText,
         hasActiveFilters = data.hasActiveFilters;
-
-      // Ocultamos el spinner por defecto en cada actualización
-      this.tag('Spinner').alpha = 0;
-      this._isLoadingFlag = isFetching || isLoading;
-      if (this._isLoadingFlag) {
+      const loading = Boolean(isFetching || isLoading);
+      if (loading) {
         this.alpha = 1;
-        this.tag('Spinner').alpha = 1;
-        this.tag('Message').text.text = 'Conectando con el universo del stream argentino...';
+        this.tag('Container.Message').text.text = 'Cargando programación en vivo...';
+        this.tag('Container.SubMessage').text.text = 'Verificando señales activas y depurando transmisiones';
+        if (this._pulseAnim && !this._pulseAnim.isPlaying()) {
+          this._pulseAnim.start();
+        }
+      } else if (!hasChannels && (searchText || hasActiveFilters || !hasFilteredChannels)) {
+        if (this._pulseAnim) this._pulseAnim.stop();
+        this.tag('Container.AccentBar').w = 64;
+        this.tag('Container.AccentBar').alpha = 1;
+        this.alpha = 1;
+        this.tag('Container.Message').text.text = 'No encontramos canales con esos filtros';
+        this.tag('Container.SubMessage').text.text = 'Probá limpiar la búsqueda o cambiar la provincia seleccionada en el menú superior.';
       } else if (!hasChannels) {
+        if (this._pulseAnim) this._pulseAnim.stop();
         this.alpha = 1;
-        this.tag('Message').text.text = 'No se encontraron canales configurados.';
-      } else if (!hasFilteredChannels && (searchText || hasActiveFilters)) {
-        this.alpha = 1;
-        this.tag('Message').text.text = 'No hay resultados para la búsqueda actual.';
+        this.tag('Container.Message').text.text = 'No se pudieron obtener los canales';
+        this.tag('Container.SubMessage').text.text = 'Seleccioná "Actualizar" en la barra superior para reintentar.';
       } else {
-        this.alpha = 0; // Ninguna condición se cumple, se oculta todo (return null)
+        if (this._pulseAnim) this._pulseAnim.stop();
+        this.alpha = 0;
       }
     }
   }
@@ -7306,172 +7948,332 @@ var APP_com_domain_app_ZappingStream = (function () {
         w: 1920,
         h: 1080,
         rect: true,
-        color: 0xcc000000,
-        // modal-overlay (fondo oscuro semi-transparente)
+        color: 0xd908080a,
         alpha: 0,
-        // Inicia oculto para poder animar su aparición
-
         Content: {
           mount: 0.5,
           x: 960,
           y: 540,
-          w: 1300,
-          h: 850,
+          w: 1220,
+          h: 780,
           rect: true,
-          color: 0xff1e1e1e,
-          // Color de fondo del modal
+          color: COLORS.BG_DARK,
           shader: {
             type: Lightning$1.shaders.RoundedRectangle,
-            radius: 16
+            radius: BORDER_RADIUS.LARGE,
+            stroke: 2,
+            strokeColor: COLORS.BORDER_LIGHT
           },
-          Title: {
-            x: 650,
-            y: 60,
-            mountX: 0.5,
-            text: {
-              text: '¿Qué es Zapping Stream?',
-              fontSize: 48,
-              fontFace: 'Regular',
-              textColor: 0xffffffff
-            }
-          },
-          Body: {
-            x: 80,
-            y: 150,
-            text: {
-              // Unimos los párrafos con saltos de línea (\n)
-              text: 'Zapping Stream reúne todos los canales de streaming de Argentina en un solo lugar. El objetivo es brindarle a la comunidad un punto de acceso de descubrimiento de canales y contenido por fuera del algoritmo.\n\nEl sitio interactúa directo con YouTube: si se hace click en una tarjeta, el sitio enlaza directo al video o canal de Youtube. El sitio también permite buscar canales por nombre o ciudad.\n\nSe puede visualizar por canal o por transmisiones programadas. Nuestro propósito es facilitar el descubrimiento de contenido local y promover la visibilidad de todos los creadores y medios independientes.',
-              fontSize: 28,
-              fontFace: 'Regular',
-              textColor: 0xddffffff,
-              wordWrapWidth: 1140,
-              lineHeight: 40
-            }
-          },
-          Contact: {
-            x: 650,
-            y: 470,
-            mountX: 0.5,
-            text: {
-              text: 'Si tu canal no aparece en la lista y querés sumarlo, o si deseás solicitar\nla baja de tu contenido, escribinos a: contacto@zappingstream.com',
-              fontSize: 26,
-              fontFace: 'Regular',
-              textColor: 0xfffbb03b,
-              // Color de acento
-              wordWrapWidth: 1140,
-              lineHeight: 40,
-              textAlign: 'center'
-            }
-          },
-          Legal: {
-            x: 80,
-            y: 600,
-            text: {
-              text: 'Al utilizar este sitio, aceptas los Términos de Servicio de YouTube y la Política de Privacidad de Google. Los logos, miniaturas, nombres y descripciones son extraídos directamente de YouTube API Services.\n\nEste sitio es un directorio de canales independiente. No alojamos ni retransmitimos contenido propio. Todos los videos, marcas y logotipos son propiedad exclusiva de sus respectivos creadores y se visualizan a través del reproductor oficial de YouTube.',
-              fontSize: 22,
-              fontFace: 'Regular',
-              textColor: 0xffaaaaaa,
-              wordWrapWidth: 1140,
-              lineHeight: 32
-            }
-          },
-          // Nuestro botón de "Volver"
-          Button: {
-            x: 650,
-            y: 750,
-            mountX: 0.5,
-            w: 240,
-            h: 60,
+          TopAccent: {
+            x: 0,
+            y: 0,
+            w: 1220,
+            h: 6,
             rect: true,
-            color: 0xff444444,
-            // Fondo del botón por defecto
-            shader: {
-              type: Lightning$1.shaders.RoundedRectangle,
-              radius: 8
-            },
-            Text: {
-              mount: 0.5,
-              x: 120,
-              y: 30,
+            color: COLORS.NETFLIX_RED
+          },
+          // Vista 1: Acerca de Zapping Stream
+          AboutView: {
+            alpha: 1,
+            Title: {
+              x: 610,
+              y: 48,
+              mountX: 0.5,
               text: {
-                text: 'Volver',
-                fontSize: 28,
-                fontFace: 'Regular',
-                textColor: 0xffffffff
+                text: '¿Qué es Zapping Stream?',
+                fontSize: 42,
+                fontStyle: 'bold',
+                fontFace: TYPOGRAPHY.FONT_FAMILY,
+                textColor: COLORS.TEXT_WHITE
+              }
+            },
+            Body: {
+              x: 76,
+              y: 132,
+              text: {
+                text: 'Zapping Stream reúne todos los canales de streaming de Argentina en un solo lugar. Nuestro objetivo es brindarle a la comunidad un punto de acceso y descubrimiento de canales y contenidos locales por fuera del algoritmo.\n\nPodés navegar las señales en vivo al instante o explorar la guía de transmisiones programadas por día, provincia y ciudad.',
+                fontSize: 24,
+                fontFace: TYPOGRAPHY.FONT_FAMILY,
+                textColor: COLORS.TEXT_LIGHT,
+                wordWrapWidth: 1068,
+                lineHeight: 36
+              }
+            },
+            ContactBox: {
+              x: 76,
+              y: 366,
+              w: 1068,
+              h: 108,
+              rect: true,
+              color: COLORS.BG_PANEL,
+              shader: {
+                type: Lightning$1.shaders.RoundedRectangle,
+                radius: BORDER_RADIUS.MEDIUM
+              },
+              ContactText: {
+                mount: 0.5,
+                x: 534,
+                y: 54,
+                text: {
+                  text: '¿Querés sumar tu canal o solicitar la baja de contenido?\nEscribinos a: contacto@zappingstream.com',
+                  fontSize: 23,
+                  fontStyle: 'bold',
+                  fontFace: TYPOGRAPHY.FONT_FAMILY,
+                  textColor: COLORS.TEXT_WHITE,
+                  wordWrapWidth: 1000,
+                  lineHeight: 34,
+                  textAlign: 'center'
+                }
+              }
+            },
+            Legal: {
+              x: 76,
+              y: 504,
+              text: {
+                text: 'Al utilizar esta aplicación aceptás los Términos de Servicio de YouTube y la Política de Privacidad de Google. Los logotipos, miniaturas, nombres y descripciones se obtienen de YouTube API Services.\n\nDirectorio independiente: no alojamos ni retransmitimos contenido propio. Todos los videos y marcas pertenecen a sus respectivos creadores.',
+                fontSize: 19,
+                fontFace: TYPOGRAPHY.FONT_FAMILY,
+                textColor: COLORS.TEXT_GRAY,
+                wordWrapWidth: 1068,
+                lineHeight: 28
+              }
+            }
+          },
+          // Vista 2: Ficha de Canal Individual (desde Guía de Transmisiones)
+          ChannelView: {
+            alpha: 0,
+            Avatar: {
+              x: 76,
+              y: 62,
+              w: 96,
+              h: 96,
+              alpha: 0,
+              shader: {
+                type: Lightning$1.shaders.RoundedRectangle,
+                radius: 48
+              }
+            },
+            Name: {
+              x: 196,
+              y: 64,
+              text: {
+                text: '',
+                fontSize: 42,
+                fontStyle: 'bold',
+                fontFace: TYPOGRAPHY.FONT_FAMILY,
+                textColor: COLORS.TEXT_WHITE,
+                maxLines: 1,
+                wordWrapWidth: 940,
+                textOverflow: 'ellipsis'
+              }
+            },
+            Meta: {
+              x: 196,
+              y: 122,
+              text: {
+                text: '',
+                fontSize: 22,
+                fontStyle: 'bold',
+                fontFace: TYPOGRAPHY.FONT_FAMILY,
+                textColor: COLORS.NETFLIX_RED
+              }
+            },
+            Description: {
+              x: 76,
+              y: 200,
+              text: {
+                text: '',
+                fontSize: 24,
+                fontFace: TYPOGRAPHY.FONT_FAMILY,
+                textColor: COLORS.TEXT_LIGHT,
+                wordWrapWidth: 1068,
+                maxLines: 10,
+                lineHeight: 36,
+                textOverflow: 'ellipsis'
+              }
+            }
+          },
+          // Botonera inferior
+          Actions: {
+            y: 676,
+            PrimaryBtn: {
+              alpha: 0,
+              x: 370,
+              w: 230,
+              h: 56,
+              rect: true,
+              color: COLORS.NETFLIX_RED,
+              shader: {
+                type: Lightning$1.shaders.RoundedRectangle,
+                radius: BORDER_RADIUS.MEDIUM
+              },
+              Label: {
+                mount: 0.5,
+                x: 115,
+                y: 29,
+                text: {
+                  text: '▶  Ver canal',
+                  fontSize: 22,
+                  fontStyle: 'bold',
+                  fontFace: TYPOGRAPHY.FONT_FAMILY,
+                  textColor: COLORS.TEXT_WHITE
+                }
+              }
+            },
+            CloseBtn: {
+              x: 495,
+              w: 230,
+              h: 56,
+              rect: true,
+              color: COLORS.FOCUS_WHITE,
+              shader: {
+                type: Lightning$1.shaders.RoundedRectangle,
+                radius: BORDER_RADIUS.MEDIUM
+              },
+              Label: {
+                mount: 0.5,
+                x: 115,
+                y: 29,
+                text: {
+                  text: 'Volver',
+                  fontSize: 22,
+                  fontStyle: 'bold',
+                  fontFace: TYPOGRAPHY.FONT_FAMILY,
+                  textColor: COLORS.BG_BLACK
+                }
               }
             }
           }
         }
       };
     }
-
-    // Equivalente al "props.onClose"
+    _construct() {
+      this._mode = 'about'; // 'about' | 'channel'
+      this._btnIndex = 0; // 0 = PrimaryBtn (si channel), 1 = CloseBtn
+      this._channel = null;
+      this._onPlayChannel = null;
+    }
+    _init() {
+      this.tag('Content.ChannelView.Avatar').on('txLoaded', () => {
+        this.tag('Content.ChannelView.Avatar').alpha = 1;
+      });
+      this.tag('Content.ChannelView.Avatar').on('txError', () => {
+        this.tag('Content.ChannelView.Avatar').alpha = 0;
+      });
+    }
     set onClose(callback) {
       this._onCloseCallback = callback;
     }
-
-    // Cuando el modal pasa a estar activo (se muestra en pantalla)
-    _active() {
-      this.patch({
-        smooth: {
-          alpha: 1
-        } // Fade In suave
+    set modalData(data) {
+      if (!data || !data.channel) {
+        this._mode = 'about';
+        this._channel = null;
+        this._onPlayChannel = null;
+        this._btnIndex = 1;
+        this.tag('Content.AboutView').alpha = 1;
+        this.tag('Content.ChannelView').alpha = 0;
+        this.tag('Content.Actions.PrimaryBtn').alpha = 0;
+        this.tag('Content.Actions.CloseBtn').x = 495;
+        this._updateButtonsVisual();
+        return;
+      }
+      this._mode = 'channel';
+      this._channel = data.channel;
+      this._onPlayChannel = data.onPlayChannel;
+      this._btnIndex = 0;
+      const ch = data.channel;
+      const activesCount = ch.Actives ? Object.keys(ch.Actives).length : 0;
+      const upcomingCount = ch.Upcoming ? Object.keys(ch.Upcoming).length : 0;
+      this.tag('Content.AboutView').alpha = 0;
+      this.tag('Content.ChannelView').alpha = 1;
+      const avatarSrc = ch.ChannelImgUrl ? getOptimizedImageUrl(ch.ChannelImgUrl, 160) : '';
+      if (avatarSrc) {
+        this.tag('Content.ChannelView.Avatar').alpha = 0.001;
+        this.tag('Content.ChannelView.Avatar').src = avatarSrc;
+        this.tag('Content.ChannelView.Name').x = 196;
+        this.tag('Content.ChannelView.Meta').x = 196;
+      } else {
+        this.tag('Content.ChannelView.Avatar').alpha = 0;
+        this.tag('Content.ChannelView.Name').x = 76;
+        this.tag('Content.ChannelView.Meta').x = 76;
+      }
+      this.tag('Content.ChannelView.Name').text.text = ch.ChannelName || '';
+      const metaParts = [];
+      if (activesCount > 0) metaParts.push('● EN VIVO AHORA');else metaParts.push('ON DEMAND');
+      if (ch.ChannelCity) {
+        metaParts.push(data.provinceName && data.provinceName !== ch.ChannelCity ? "\uD83D\uDCCD ".concat(ch.ChannelCity, ", ").concat(data.provinceName) : "\uD83D\uDCCD ".concat(ch.ChannelCity));
+      }
+      if (upcomingCount > 0) metaParts.push("".concat(upcomingCount, " pr\xF3ximas en gu\xEDa"));
+      this.tag('Content.ChannelView.Meta').text.text = metaParts.join('   •   ');
+      this.tag('Content.ChannelView.Description').text.text = ch.ChannelDescription || 'Sin descripción disponible para este canal.';
+      this.tag('Content.Actions.PrimaryBtn').patch({
+        alpha: 1,
+        x: 350,
+        w: 250,
+        Label: {
+          x: 125,
+          text: {
+            text: activesCount > 0 ? '▶  Ver en vivo' : '📅  Transmisiones'
+          }
+        }
+      });
+      this.tag('Content.Actions.CloseBtn').x = 625;
+      this._updateButtonsVisual();
+    }
+    _updateButtonsVisual() {
+      const primaryFocused = this._mode === 'channel' && this._btnIndex === 0;
+      const closeFocused = this._mode !== 'channel' || this._btnIndex === 1;
+      this.tag('Content.Actions.PrimaryBtn').patch({
+        color: primaryFocused ? COLORS.FOCUS_WHITE : COLORS.NETFLIX_RED,
+        Label: {
+          text: {
+            textColor: primaryFocused ? COLORS.BG_BLACK : COLORS.TEXT_WHITE
+          }
+        }
+      });
+      this.tag('Content.Actions.CloseBtn').patch({
+        color: closeFocused ? COLORS.FOCUS_WHITE : COLORS.BG_PANEL,
+        Label: {
+          text: {
+            textColor: closeFocused ? COLORS.BG_BLACK : COLORS.TEXT_WHITE
+          }
+        }
       });
     }
-
-    // Cuando el componente pasa a estar inactivo (se oculta)
-    _inactive() {
-      this.alpha = 0;
+    _handleLeft() {
+      if (this._mode === 'channel' && this._btnIndex === 1) {
+        this._btnIndex = 0;
+        this._updateButtonsVisual();
+      }
+      return true;
     }
-
-    // === Manejo del Control Remoto ===
-
-    // Este método captura el foco general del componente
-    _getFocused() {
-      return this;
+    _handleRight() {
+      if (this._mode === 'channel' && this._btnIndex === 0) {
+        this._btnIndex = 1;
+        this._updateButtonsVisual();
+      }
+      return true;
     }
-
-    // Se dispara cuando el usuario aprieta la tecla OK/Enter
     _handleEnter() {
+      if (this._mode === 'channel' && this._btnIndex === 0 && this._channel && this._onPlayChannel) {
+        const targetChannel = this._channel;
+        const playFn = this._onPlayChannel;
+        if (this._onCloseCallback) this._onCloseCallback();
+        playFn(targetChannel);
+        return true;
+      }
       if (this._onCloseCallback) this._onCloseCallback();
+      return true;
     }
-
-    // Se dispara cuando el usuario aprieta la tecla Atrás/Back
     _handleBack() {
       if (this._onCloseCallback) this._onCloseCallback();
       return true;
     }
-
-    // Efecto visual de "Seleccionado" sobre el botón Volver
     _focus() {
-      this.tag('Button').patch({
-        color: 0xfffbb03b,
-        // Cambia al color de acento
-        Text: {
-          text: {
-            textColor: 0xff000000
-          }
-        },
-        // Texto negro
-        smooth: {
-          scale: 1.05
-        } // Se agranda un poquito
-      });
+      this._updateButtonsVisual();
     }
-
-    // Efecto visual cuando pierde el foco (en este caso, cuando se cierra)
-    _unfocus() {
-      this.tag('Button').patch({
-        color: 0xff444444,
-        Text: {
-          text: {
-            textColor: 0xffffffff
-          }
-        },
-        smooth: {
-          scale: 1.0
-        }
-      });
+    _getFocused() {
+      return this;
     }
   }
 
@@ -7481,31 +8283,39 @@ var APP_com_domain_app_ZappingStream = (function () {
         w: 1920,
         h: 1080,
         rect: true,
-        // El fondo debe ser transparente para poder ver el iframe en el DOM que estará detrás
-        color: 0x00000000,
-        // Nuestro botón visual (ahora es un elemento dibujado en el Canvas)
+        color: COLORS.TRANSPARENT,
         Controls: {
-          x: 60,
-          y: 60,
+          x: 64,
+          y: 48,
           alpha: 1,
+          w: 640,
+          h: 60,
           rect: true,
-          color: 0xff38b6ff,
-          // Color celeste activo simulando que está "enfocado"
+          color: 0xe6101014,
           shader: {
             type: Lightning$1.shaders.RoundedRectangle,
-            radius: 8
+            radius: BORDER_RADIUS.MEDIUM,
+            stroke: 2,
+            strokeColor: 0x44ffffff
           },
-          w: 650,
-          h: 60,
+          RedAccent: {
+            x: 0,
+            y: 12,
+            w: 5,
+            h: 36,
+            rect: true,
+            color: COLORS.NETFLIX_RED
+          },
           Text: {
             mount: 0.5,
-            x: 325,
-            y: 30,
+            x: 320,
+            y: 31,
             text: {
-              text: '‹ Atrás | OK: Pausa | ◂ 15s ▸',
-              fontSize: 24,
-              fontFace: 'Bold',
-              textColor: 0xff000000
+              text: '↩ Volver   •   OK: Pausar   •   ◀ 15s ▶',
+              fontSize: 22,
+              fontStyle: 'bold',
+              fontFace: TYPOGRAPHY.FONT_FAMILY,
+              textColor: COLORS.TEXT_WHITE
             }
           }
         }
@@ -7517,25 +8327,18 @@ var APP_com_domain_app_ZappingStream = (function () {
       this._focusInterval = null;
       this._isPlaying = true;
     }
-
-    // Se ejecuta automáticamente cuando el componente se muestra en pantalla
     _active() {
       this._isClosing = false;
       this._createIframe();
       this._wakeUpControls();
     }
-
-    // Se ejecuta automáticamente cuando el componente se oculta o destruye
     _inactive() {
       this._destroyIframe();
       this._clearTimer();
       this._clearFocusLock();
     }
-
-    // Setters equivalentes a los Props de React
     set videoId(id) {
       this._videoId = id;
-      // Si el video cambia mientras está reproduciendo, lo recargamos
       if (this.active) {
         this._destroyIframe();
         this._createIframe();
@@ -7548,8 +8351,6 @@ var APP_com_domain_app_ZappingStream = (function () {
       if (this._iframe || !this._videoId) return;
       this._currentTime = 0;
       this._duration = 0;
-
-      // Escuchamos los mensajes de YouTube para mantener sincronizado el tiempo actual
       this._messageListener = event => {
         try {
           const data = JSON.parse(event.data);
@@ -7557,18 +8358,20 @@ var APP_com_domain_app_ZappingStream = (function () {
             if (data.info.currentTime !== undefined) this._currentTime = data.info.currentTime;
             if (data.info.duration !== undefined) this._duration = data.info.duration;
           }
-        } catch (e) {}
+        } catch (err) {
+          // Ignorar mensajes externos que no sean JSON
+        }
       };
       window.addEventListener('message', this._messageListener);
+      const isRemoteHttps = window.location && window.location.protocol === 'https:' && window.location.hostname !== 'localhost';
+      const originParam = isRemoteHttps ? "&origin=".concat(encodeURIComponent(window.location.origin)) : '';
       this._iframe = document.createElement('iframe');
       this._iframe.className = 'tv-iframe';
-      // Agregamos enablejsapi=1 para poder enviarle comandos mediante postMessage
-      this._iframe.src = "https://www.youtube-nocookie.com/embed/".concat(this._videoId, "?autoplay=1&fs=1&modestbranding=1&rel=0&enablejsapi=1&origin=").concat(window.location.origin);
+      this._iframe.src = "https://www.youtube-nocookie.com/embed/".concat(this._videoId, "?autoplay=1&fs=1&modestbranding=1&rel=0&enablejsapi=1").concat(originParam);
       this._iframe.frameBorder = '0';
+      this._iframe.referrerPolicy = 'strict-origin-when-cross-origin';
       this._iframe.allow = 'accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture';
       this._iframe.allowFullscreen = true;
-
-      // Estilos para que ocupe toda la pantalla y quede por debajo del canvas de Lightning
       this._iframe.style.position = 'absolute';
       this._iframe.style.top = '0';
       this._iframe.style.left = '0';
@@ -7576,8 +8379,6 @@ var APP_com_domain_app_ZappingStream = (function () {
       this._iframe.style.height = '100vh';
       this._iframe.style.zIndex = '0';
       this._iframe.style.border = 'none';
-
-      // Le indicamos a YouTube que nos empiece a enviar los reportes de tiempo
       this._iframe.onload = () => {
         if (this._iframe && this._iframe.contentWindow) {
           this._iframe.contentWindow.postMessage(JSON.stringify({
@@ -7595,8 +8396,6 @@ var APP_com_domain_app_ZappingStream = (function () {
         this._messageListener = null;
       }
       if (this._iframe) {
-        // Forzamos un STOP nativo en el iframe antes de destruirlo
-        // (evita el bug de Tizen donde el audio sigue sonando de fondo)
         if (this._iframe.contentWindow) {
           this._iframe.contentWindow.postMessage(JSON.stringify({
             event: 'command',
@@ -7624,9 +8423,9 @@ var APP_com_domain_app_ZappingStream = (function () {
         this.tag('Controls').patch({
           smooth: {
             alpha: 0
-          } // Desvanecimiento suave en Lightning
+          }
         });
-        this._timer = null; // Limpiamos la referencia para saber que está oculto
+        this._timer = null;
       }, 4000);
     }
     _clearTimer() {
@@ -7638,13 +8437,11 @@ var APP_com_domain_app_ZappingStream = (function () {
     _updateControlsText() {
       const textNode = this.tag('Controls.Text');
       if (this._isPlaying) {
-        textNode.text.text = '‹ Atrás | OK: Pausa | ◂ 15s ▸';
+        textNode.text.text = '↩ Volver   •   OK: Pausar   •   ◀ 15s ▶';
       } else {
-        textNode.text.text = '⏸ PAUSADO | OK: Reproducir | ‹ Atrás';
+        textNode.text.text = '⏸ PAUSADO   •   OK: Reproducir   •   ↩ Volver';
       }
     }
-
-    // Este método intercepta la tecla Escape y Backspace (Atrás) por defecto en Lightning
     _handleBack() {
       if (this._isClosing) return true;
       this._isClosing = true;
@@ -7653,12 +8450,8 @@ var APP_com_domain_app_ZappingStream = (function () {
       }
       return true;
     }
-
-    // Interceptamos el botón OK/Enter del control remoto
     _handleEnter() {
       this._isPlaying = !this._isPlaying;
-
-      // Enviar comando Play/Pause directo al Iframe usando postMessage
       if (this._iframe && this._iframe.contentWindow) {
         const command = this._isPlaying ? 'playVideo' : 'pauseVideo';
         this._iframe.contentWindow.postMessage(JSON.stringify({
@@ -7671,8 +8464,6 @@ var APP_com_domain_app_ZappingStream = (function () {
       this._wakeUpControls();
       return true;
     }
-
-    // --- Controles de Tiempo (Izquierda / Derecha) ---
     _handleLeft() {
       this._seek(-15);
       return true;
@@ -7683,13 +8474,10 @@ var APP_com_domain_app_ZappingStream = (function () {
     }
     _seek(seconds) {
       if (this._iframe && this._iframe.contentWindow) {
-        // Calculamos el nuevo tiempo asegurándonos de no ir a negativos ni pasarnos del final
         this._currentTime = Math.max(0, this._currentTime + seconds);
         if (this._duration > 0) {
           this._currentTime = Math.min(this._currentTime, this._duration);
         }
-
-        // Le ordenamos a YouTube que salte a ese segundo (true permite hacer buffering anticipado)
         this._iframe.contentWindow.postMessage(JSON.stringify({
           event: 'command',
           func: 'seekTo',
@@ -7698,153 +8486,128 @@ var APP_com_domain_app_ZappingStream = (function () {
         this._wakeUpControls();
       }
     }
-
-    // Este método intercepta cualquier otra tecla (flechas, enter)
     _handleKey() {
       this._wakeUpControls();
-      return false; // Retornar false permite que las teclas hagan otras cosas si es necesario
+      return false;
     }
   }
 
   class VideoCard extends Lightning$1.Component {
     static _template() {
       return {
-        w: 280,
-        // Candado base para grilla normal
-        h: 175,
-        // Aspect ratio 16:10
+        w: 340,
+        h: 191,
         rect: true,
-        color: 0xff111111,
-        // var(--bg-black)
+        color: COLORS.BG_CARD,
         clipping: true,
-        // Evita que la imagen se salga de los bordes
-        shader: {
-          type: Lightning$1.shaders.RoundedRectangle,
-          radius: 8
-        },
         Fallback: {
-          w: w => w - 24,
-          // Achicamos 12px de cada lado
-          h: h => h - 24,
-          x: 12,
-          y: 12,
+          w: w => w,
+          h: h => h,
           rect: true,
-          color: 0xff333333,
-          // Fondo gris del fallback
-          shader: {
-            type: Lightning$1.shaders.RoundedRectangle,
-            radius: 6
-          } // Le damos bordes redondeados internos
+          color: 0xff22222a,
+          Initials: {
+            mount: 0.5,
+            x: w => w / 2,
+            y: h => h / 2,
+            text: {
+              text: '',
+              fontSize: 42,
+              fontStyle: 'bold',
+              fontFace: TYPOGRAPHY.FONT_FAMILY,
+              textColor: 0x44ffffff
+            }
+          }
         },
         Image: {
-          w: w => w - 24,
-          h: h => h - 24,
-          x: 12,
-          y: 12,
-          alpha: 1,
-          // DEBE iniciar en 1 para que WebGL fuerce la descarga de la textura
-          shader: {
-            type: Lightning$1.shaders.RoundedRectangle,
-            radius: 6
-          }
+          w: w => w,
+          h: h => h,
+          alpha: 0.001
+        },
+        BottomScrim: {
+          x: 0,
+          y: h => h - 52,
+          w: w => w,
+          h: 52,
+          rect: true,
+          colorTop: 0x00000000,
+          colorBottom: 0xb8000000
         },
         Badge: {
           mountX: 1,
           mountY: 1,
-          x: w => w - 20,
-          // Empujamos el cartelito de 'En Vivo' hacia adentro
-          y: h => h - 20,
+          x: w => w - 10,
+          y: h => h - 10,
+          h: 24,
+          w: 90,
           rect: true,
-          color: 0x00000000,
-          // Transparente por defecto
+          color: COLORS.LIVE_BADGE,
           alpha: 0,
           shader: {
             type: Lightning$1.shaders.RoundedRectangle,
-            radius: 4
+            radius: BORDER_RADIUS.SMALL
           },
           Dot: {
             w: 6,
             h: 6,
             x: 8,
             mountY: 0.5,
-            y: 13,
+            y: 12,
             rect: true,
-            color: 0xffffffff,
-            shader: {
-              type: Lightning$1.shaders.RoundedRectangle,
-              radius: 3
-            },
-            alpha: 0 // Oculto por defecto
+            color: COLORS.TEXT_WHITE,
+            alpha: 0
           },
           Text: {
             x: 8,
-            // Dinámico si hay punto
             mountY: 0.5,
-            y: 14,
-            // Compensación visual vertical
+            y: 13,
             text: {
               text: '',
-              fontSize: 14,
-              // Equivalente a 0.75rem
-              fontFace: 'Regular',
-              textColor: 0xffffffff
+              fontSize: 13,
+              fontStyle: 'bold',
+              fontFace: TYPOGRAPHY.FONT_FAMILY,
+              textColor: COLORS.TEXT_WHITE
             }
           }
         }
       };
     }
     _init() {
-      // Escuchar error en la carga de la imagen
-      this.tag('Image').on('txError', () => {
-        this._handleImageError();
-      });
-
-      // Escuchar cuando la imagen carga exitosamente
       this.tag('Image').on('txLoaded', () => {
-        // Si está todo bien, mostramos la imagen
         this.tag('Image').alpha = 1;
         this.tag('Fallback').alpha = 0;
       });
+      this.tag('Image').on('txError', () => {
+        this._showFallbackOnly();
+      });
     }
-    _handleImageError() {
+    _showFallbackOnly() {
       this.tag('Image').alpha = 0;
       this.tag('Fallback').alpha = 1;
-
-      // Llama al callback de error si fue provisto
-      if (this.onImageError) {
+      // Nota clave para TV: NO disparamos re-renderizados ni borrados de la grilla en tiempo de WebGL.
+      // Los borrados ya ocurrieron previamente en channelService antes de montar la vista.
+      if (typeof this.onImageError === 'function') {
         this.onImageError();
       }
     }
-
-    // Setter equivalente a pasarle "props" desde React
     set item(data) {
-      const oldImageUrl = this._imageUrl;
-      this._imageUrl = data.imageUrl;
-      this._fallbackText = data.fallbackText;
+      if (!data) return;
+      const oldSrc = this._finalSrc;
+      this._fallbackText = data.fallbackText || data.altText || '';
       this.onClick = data.onClick;
       this.onImageError = data.onImageError;
-
-      // Si hay imagen, asigarla para iniciar la carga
-      if (this._imageUrl) {
-        // Solo reiniciamos la carga si la URL es nueva. 
-        // Lightning no dispara 'txLoaded' si se reasigna la misma URL, dejando la imagen en 0.001
-        if (oldImageUrl !== this._imageUrl || !this.tag('Image').src) {
-          this.tag('Fallback').alpha = 1; // Aseguramos que el fallback se vea mientras carga
-
-          // TRUCO LIGHTNING: alpha debe ser > 0 para que el motor webGL NO la ignore y la descargue
+      const initials = this._fallbackText ? this._fallbackText.trim().split(/\s+/).slice(0, 2).map(w => w.charAt(0).toUpperCase()).join('') : 'TV';
+      this.tag('Fallback.Initials').text.text = initials;
+      const nextSrc = data.imageUrl ? getOptimizedImageUrl(data.imageUrl, 380, data.cacheKey) : '';
+      if (nextSrc) {
+        if (oldSrc !== nextSrc || !this.tag('Image').src) {
+          this._finalSrc = nextSrc;
+          this.tag('Fallback').alpha = 1;
           this.tag('Image').alpha = 0.001;
-
-          // OPTIMIZACIÓN: Pedir miniatura de menor peso (mqdefault 320x180) de YouTube
-          let finalSrc = this._imageUrl.replace(/(maxresdefault|hqdefault|sddefault)\.jpg/i, 'mqdefault.jpg');
-
-          // --- SOLUCIÓN DEFINITIVA A CORS EN WEBGL ---
-          if (finalSrc.includes('ytimg.com') || finalSrc.includes('youtube.com') || finalSrc.includes('ggpht.com')) {
-            finalSrc = "https://wsrv.nl/?url=".concat(encodeURIComponent(finalSrc), "&w=400&output=webp");
-          }
-          this.tag('Image').src = finalSrc;
+          this.tag('Image').src = nextSrc;
         }
       } else {
-        this._handleImageError();
+        this._finalSrc = '';
+        this._showFallbackOnly();
       }
       this._updateBadge(data);
     }
@@ -7856,421 +8619,62 @@ var APP_com_domain_app_ZappingStream = (function () {
       const badge = this.tag('Badge');
       const label = this.tag('Badge.Text');
       const dot = this.tag('Badge.Dot');
-      badge.alpha = 1;
       let text = '';
       let hasDot = false;
-      let textColor = 0xffffffff;
-      let strokeColor = 0x00000000;
-      let strokeWidth = 0;
-
-      // Colores base equivalentes a las variables de tu CSS original
-      const PREMIERE_COLOR = 0xff0055ff; // Azul
-      const LIVE_COLOR = 0xffff0000; // Rojo
-      const PAST_BG = 0xe6000000; // rgba(0,0,0,0.9)
-      const PAST_TEXT = 0xffbbbbbb; // Gris texto
-      const UPCOMING_BG = 0xc03d3d3c; // rgba(61,61,60,0.75)
-
+      let bgColor = COLORS.LIVE_BADGE;
+      let textColor = COLORS.TEXT_WHITE;
       if (isLive) {
-        badge.color = isPremiere ? PREMIERE_COLOR : LIVE_COLOR;
+        bgColor = isPremiere ? COLORS.PREMIERE_BADGE : COLORS.LIVE_BADGE;
         text = isPremiere ? 'ESTRENO' : 'EN VIVO';
         hasDot = true;
-        strokeWidth = isPremiere ? 1 : 0;
-        strokeColor = PREMIERE_COLOR;
       } else if (isPast) {
-        badge.color = PAST_BG;
-        textColor = PAST_TEXT;
-        text = isPremiere ? 'ESTRENADO' : 'FINALIZADO';
-        strokeWidth = 1;
-        strokeColor = isPremiere ? 0xff002a80 : 0xff800000; // color-mix black 50%
+        bgColor = 0xd918181c;
+        textColor = COLORS.TEXT_LIGHT;
+        text = isPremiere ? 'ESTRENADO' : 'EMITIDO';
       } else if (isUpcoming) {
-        badge.color = UPCOMING_BG;
-        text = isPremiere ? 'ESTRENO PROG.' : 'PROGRAMADO';
-        strokeWidth = 1;
-        strokeColor = isPremiere ? PREMIERE_COLOR : LIVE_COLOR;
+        bgColor = 0xd9272730;
+        textColor = COLORS.TEXT_WHITE;
+        text = isPremiere ? 'ESTRENO PROG.' : 'PRÓXIMO';
       } else {
-        badge.alpha = 0; // Ocultar si no cumple ninguna condición
+        badge.alpha = 0;
         return;
       }
+      badge.alpha = 1;
+      badge.color = bgColor;
       label.text.text = text;
       label.text.textColor = textColor;
       if (hasDot) {
         dot.alpha = 1;
-        label.x = 20; // Hacemos lugar para el punto
-        badge.w = text.length * 8 + 30; // Aproximación ancho con punto
+        label.x = 19;
+        badge.w = text.length * 8 + 28;
       } else {
         dot.alpha = 0;
-        label.x = 8;
-        badge.w = text.length * 8 + 16; // Aproximación ancho sin punto
+        label.x = 9;
+        badge.w = text.length * 8 + 18;
       }
-      badge.h = 26; // Alto fijo para el fondo
-      badge.shader = {
-        type: Lightning$1.shaders.RoundedRectangle,
-        radius: 4,
-        stroke: strokeWidth,
-        strokeColor
-      };
     }
-
-    // Equivalente al onClick en la TV (Apretar OK/Enter en el control remoto)
     _handleEnter() {
       if (this.onClick) {
         this.onClick(this);
       }
     }
-
-    // Efecto visual cuando navegas hacia la tarjeta
-    _focus() {}
-
-    // Efecto visual cuando sales de la tarjeta
-    _unfocus() {}
   }
 
-  const getFreshImage = (url, dateString) => {
-    if (!url) return url;
-    const timestamp = new Date(dateString || Date.now()).getTime();
-    const separator = url.includes('?') ? '&' : '?';
-    return "".concat(url).concat(separator, "t=").concat(timestamp);
-  };
-
-  class ChannelCard extends Lightning$1.Component {
-    static _template() {
-      return {
-        w: 380,
-        h: 320,
-        rect: true,
-        color: 0xff1a1a1a,
-        // bg-dark
-        shader: {
-          type: Lightning$1.shaders.RoundedRectangle,
-          radius: 15,
-          stroke: 0,
-          strokeColor: 0x00000000
-        },
-        clipping: true,
-        // Cabecera: Logo y Título
-        Header: {
-          y: 20,
-          x: 20,
-          w: 340,
-          Logo: {
-            w: 32,
-            h: 32,
-            alpha: 0,
-            // Se muestra solo si hay imagen
-            shader: {
-              type: Lightning$1.shaders.RoundedRectangle,
-              radius: 16
-            }
-          },
-          Title: {
-            x: 42,
-            y: 4,
-            text: {
-              text: '',
-              fontSize: 26,
-              fontFace: 'Regular',
-              textColor: 0xffffffff,
-              wordWrapWidth: 200,
-              maxLines: 1,
-              textOverflow: 'ellipsis'
-            }
-          },
-          InfoBtn: {
-            x: 260,
-            y: 0,
-            w: 80,
-            h: 36,
-            rect: true,
-            color: 0x00000000,
-            shader: {
-              type: Lightning$1.shaders.RoundedRectangle,
-              radius: 8,
-              stroke: 1,
-              strokeColor: 0xff888888
-            },
-            Text: {
-              mount: 0.5,
-              x: 40,
-              y: 19,
-              text: {
-                text: 'Info',
-                fontSize: 20,
-                fontFace: 'Regular',
-                textColor: 0xff888888
-              }
-            }
-          }
-        },
-        // Cuerpo: Pool estático interno de VideoCards (Evita instanciarlas en tiempo real)
-        Body: {
-          y: 75,
-          x: 20,
-          Video_0: {
-            type: VideoCard,
-            alpha: 0,
-            x: -9999
-          },
-          Video_1: {
-            type: VideoCard,
-            alpha: 0,
-            x: -9999
-          },
-          Video_2: {
-            type: VideoCard,
-            alpha: 0,
-            x: -9999
-          },
-          Video_3: {
-            type: VideoCard,
-            alpha: 0,
-            x: -9999
-          },
-          Video_4: {
-            type: VideoCard,
-            alpha: 0,
-            x: -9999
-          }
-        },
-        // Textos para la versión expandida (On-Demand)
-        ExpandedInfo: {
-          alpha: 0,
-          // Oculto por defecto
-          y: 75,
-          x: 20,
-          City: {
-            y: 280,
-            text: {
-              text: '',
-              fontSize: 22,
-              textColor: 0xff38b6ff,
-              fontFace: 'Bold'
-            }
-          },
-          Desc: {
-            y: 320,
-            text: {
-              text: '',
-              fontSize: 20,
-              textColor: 0xffdddddd,
-              fontFace: 'Regular',
-              wordWrapWidth: 460,
-              maxLines: 10,
-              lineHeight: 30
-            }
-          }
-        }
-      };
-    }
-
-    // Manejador del estado y propiedades
-    set item(data) {
-      this._item = data;
-      this._updateLayout();
-    }
-    get item() {
-      return this._item;
-    }
-    _updateLayout() {
-      if (!this._item) return;
-      const _this$_item = this._item,
-        channel = _this$_item.channel,
-        isExpanded = _this$_item.isExpanded,
-        isLiveGroup = _this$_item.isLiveGroup;
-      const failedVideos = this._item.failedVideos || new Set();
-
-      // Lógica de filtrado de videos fallidos y ordenamiento
-      let activeVideos = [];
-      if (isLiveGroup && channel.Actives) {
-        activeVideos = Object.values(channel.Actives).filter(v => !failedVideos.has(v.VideoId)).sort((a, b) => {
-          if (a.IsPremiere && !b.IsPremiere) return 1;
-          if (!a.IsPremiere && b.IsPremiere) return -1;
-          const timeA = new Date(a.ActualStartTime || a.ScheduledStartTime || a.AddedAt || 0).getTime();
-          const timeB = new Date(b.ActualStartTime || b.ScheduledStartTime || b.AddedAt || 0).getTime();
-          return timeB - timeA;
-        });
-      }
-      this._activeVideos = activeVideos;
-      const mainActive = activeVideos.length > 0 ? activeVideos[0] : null;
-      const restoActivos = activeVideos.slice(1);
-
-      // Cálculo de dimensiones del componente contenedor
-      let targetWidth = 380;
-      let targetHeight = 320;
-      if (isExpanded) {
-        targetWidth = 500;
-        targetHeight = 720; // Más alto para acomodar texto expandido
-      } else if (isLiveGroup && restoActivos.length > 0) {
-        targetWidth = 380 + restoActivos.length * 355; // 340 de width de VideoCard + 15 de gap
-      }
-      this.w = targetWidth;
-      this.h = targetHeight;
-      this.tag('Header').w = targetWidth - 40;
-      this.tag('Header.InfoBtn').x = targetWidth - 40 - 80;
-
-      // --- Render Header ---
-      const showMiniLogo = channel.ChannelImgUrl && (isExpanded || isLiveGroup && mainActive);
-      this.tag('Header.Logo').patch({
-        src: showMiniLogo ? channel.ChannelImgUrl : null,
-        alpha: showMiniLogo ? 1 : 0
-      });
-      this.tag('Header.Title').patch({
-        x: showMiniLogo ? 45 : 0,
-        text: {
-          text: channel.ChannelName + ' ',
-          wordWrapWidth: targetWidth - 40 - 80 - (showMiniLogo ? 55 : 10)
-        }
-      });
-      this.tag('Header.InfoBtn.Text').text.text = isExpanded ? 'Ocultar' : 'Info';
-
-      // --- Render Body ---
-      this.tag('ExpandedInfo').alpha = 0;
-
-      // Traemos el pool estático
-      const pool = [this.tag('Body.Video_0'), this.tag('Body.Video_1'), this.tag('Body.Video_2'), this.tag('Body.Video_3'), this.tag('Body.Video_4')];
-
-      // Ocultar todo por defecto antes de parchear
-      pool.forEach(vc => {
-        vc.alpha = 0;
-        vc.x = -9999;
-      });
-      if (isExpanded) {
-        // Modo Expandido
-        pool[0].patch({
-          w: 460,
-          h: 258,
-          // Expandido
-          x: 0,
-          alpha: 1,
-          item: {
-            imageUrl: channel.ChannelBannerUrl ? "".concat(channel.ChannelBannerUrl, "=w1707-fcrop64=1,00005a57ffffa5a8-k-c0xffffffff-no-nd-rj") : channel.ChannelImgUrl,
-            altText: channel.ChannelName,
-            fallbackText: channel.ChannelName
-          }
-        });
-        this.tag('ExpandedInfo').alpha = 1;
-        this.tag('ExpandedInfo.City').text.text = channel.ChannelCity ? "\uD83D\uDCCD ".concat(channel.ChannelCity) : '';
-        this.tag('ExpandedInfo.Desc').text.text = channel.ChannelDescription || "Sin descripción disponible.";
-      } else if (isLiveGroup && mainActive) {
-        // Modo Vivo con videos activos
-        const primaryImageUrl = mainActive.ThumbnailUrl ? getFreshImage(mainActive.ThumbnailUrl, channel.LastActivityAt) : channel.ChannelImgUrl;
-        pool[0].patch({
-          w: 340,
-          h: 191,
-          x: 0,
-          alpha: 1,
-          item: {
-            imageUrl: primaryImageUrl,
-            altText: mainActive.Title || channel.ChannelName,
-            fallbackText: channel.ChannelName,
-            isLive: mainActive.Live !== false,
-            isPremiere: mainActive.IsPremiere,
-            onImageError: () => this._handleVideoError(mainActive.VideoId)
-          }
-        });
-        restoActivos.forEach((activo, idx) => {
-          if (idx + 1 < pool.length) {
-            pool[idx + 1].patch({
-              w: 340,
-              h: 191,
-              x: 355 * (idx + 1),
-              // Lo ubicamos a la derecha (340 + 15 gap)
-              alpha: 1,
-              item: {
-                imageUrl: activo.ThumbnailUrl ? getFreshImage(activo.ThumbnailUrl, channel.LastActivityAt) : undefined,
-                altText: activo.Title,
-                fallbackText: channel.ChannelName,
-                isLive: true,
-                isPremiere: activo.IsPremiere,
-                onImageError: () => this._handleVideoError(activo.VideoId)
-              }
-            });
-          }
-        });
-      } else {
-        // Modo On-Demand estándar
-        pool[0].patch({
-          w: 340,
-          h: 191,
-          x: 0,
-          alpha: 1,
-          item: {
-            imageUrl: channel.ChannelImgUrl,
-            altText: channel.ChannelName,
-            fallbackText: channel.ChannelName
-          }
-        });
-      }
-    }
-    _handleVideoError(videoId) {
-      if (this._item.onVideoError) {
-        this._item.onVideoError(videoId);
-      }
-    }
-
-    // --- Interacciones del Control Remoto ---
-
-    _focus() {
-      // Animación al enfocar la tarjeta (agrandado suave y resaltado de borde exagerado en TV)
-      this.patch({
-        color: 0xff2a2a2a,
-        // background-color un poquito más claro
-        shader: {
-          type: Lightning$1.shaders.RoundedRectangle,
-          radius: 15,
-          stroke: 4,
-          strokeColor: 0xff38b6ff
-        },
-        // Borde celeste 4px
-        zIndex: 10
-      });
-    }
-    _unfocus() {
-      this.patch({
-        color: 0xff1a1a1a,
-        shader: {
-          type: Lightning$1.shaders.RoundedRectangle,
-          radius: 15,
-          stroke: 0,
-          strokeColor: 0x00000000
-        },
-        // Sin borde inactivo
-        zIndex: 1
-      });
-    }
-
-    // Se dispara cuando el usuario presiona "Enter" en el control
-    _handleEnter() {
-      const _this$_item2 = this._item,
-        channel = _this$_item2.channel,
-        isExpanded = _this$_item2.isExpanded,
-        isLiveGroup = _this$_item2.isLiveGroup,
-        abrirCanal = _this$_item2.abrirCanal,
-        abrirCanalOnStreams = _this$_item2.abrirCanalOnStreams;
-      if (!isExpanded) {
-        if (isLiveGroup) {
-          if (this._activeVideos && this._activeVideos.length > 1) {
-            this.fireAncestors('$onSelectStream', {
-              channel,
-              activeVideos: this._activeVideos
-            });
-          } else if (abrirCanal) {
-            abrirCanal(channel);
-          }
-        } else if (abrirCanalOnStreams) {
-          abrirCanalOnStreams(channel);
-        }
-      }
-    }
-  }
+  const DAY_BTN_W = 188;
+  const DAY_BTN_STEP = 202; // 188 + 14 gap
+  const EVENT_W = 336;
+  const EVENT_H = 254;
+  const EVENT_STEP = 356; // 336 + 20 gap
+  const ROW_STRIDE = 276; // 254 + 22 gap
 
   // ==========================================
-  // 1. Componente de Botón de Día (DayButton)
+  // 1. Píldora de Día (DayButton)
   // ==========================================
   class DayButton extends Lightning$1.Component {
     static _template() {
       return {
-        w: 200,
-        h: 60,
+        w: DAY_BTN_W,
+        h: 50,
         rect: true,
         color: COLORS.BG_PANEL,
         shader: {
@@ -8279,14 +8683,24 @@ var APP_com_domain_app_ZappingStream = (function () {
         },
         Label: {
           mount: 0.5,
-          x: 100,
-          y: 32,
+          x: DAY_BTN_W / 2,
+          y: 25,
           text: {
             text: '',
-            fontSize: 24,
+            fontSize: 20,
             fontFace: TYPOGRAPHY.FONT_FAMILY,
-            textColor: COLORS.TEXT_WHITE
+            textColor: COLORS.TEXT_LIGHT
           }
+        },
+        SelectedDot: {
+          alpha: 0,
+          mountX: 0.5,
+          x: DAY_BTN_W / 2,
+          y: 42,
+          w: 28,
+          h: 4,
+          rect: true,
+          color: COLORS.NETFLIX_RED
         }
       };
     }
@@ -8296,26 +8710,35 @@ var APP_com_domain_app_ZappingStream = (function () {
       this._updateState();
     }
     set isSelected(val) {
-      this._isSelected = val;
+      this._isSelected = Boolean(val);
       this._updateState();
     }
     _updateState() {
-      if (this.hasFocus()) {
+      const focused = this.hasFocus();
+      if (focused) {
         this.patch({
-          color: COLORS.ACCENT_BLUE,
+          color: COLORS.FOCUS_WHITE,
           Label: {
             text: {
-              textColor: COLORS.BG_BLACK
+              textColor: COLORS.BG_BLACK,
+              fontStyle: 'bold'
             }
+          },
+          SelectedDot: {
+            alpha: this._isSelected ? 1 : 0
           }
         });
       } else if (this._isSelected) {
         this.patch({
-          color: COLORS.ACCENT_BLUE,
+          color: COLORS.NETFLIX_RED,
           Label: {
             text: {
-              textColor: COLORS.BG_BLACK
+              textColor: COLORS.TEXT_WHITE,
+              fontStyle: 'bold'
             }
+          },
+          SelectedDot: {
+            alpha: 0
           }
         });
       } else {
@@ -8323,8 +8746,12 @@ var APP_com_domain_app_ZappingStream = (function () {
           color: COLORS.BG_PANEL,
           Label: {
             text: {
-              textColor: COLORS.TEXT_WHITE
+              textColor: COLORS.TEXT_GRAY,
+              fontStyle: 'normal'
             }
+          },
+          SelectedDot: {
+            alpha: 0
           }
         });
       }
@@ -8336,68 +8763,100 @@ var APP_com_domain_app_ZappingStream = (function () {
       this._updateState();
     }
     _handleEnter() {
-      this.fireAncestors('$onDaySelected', this._item.date);
+      if (this._item) {
+        this.fireAncestors('$onDaySelected', this._item.date);
+      }
+      return true;
     }
   }
 
   // ==========================================
-  // 2. Componente Evento Individual (EpgEvent)
+  // 2. Tarjeta de Programa Individual (EpgEvent)
   // ==========================================
   class EpgEvent extends Lightning$1.Component {
     static _template() {
       return {
-        w: 380,
-        h: 320,
-        rect: true,
-        color: COLORS.BG_DARK,
-        shader: {
-          type: Lightning$1.shaders.RoundedRectangle,
-          radius: BORDER_RADIUS.LARGE
-        },
-        clipping: true,
-        VideoWrapper: {
-          y: 0,
-          x: 0,
-          w: 380,
-          h: 214,
-          type: VideoCard
-        },
-        TimeBadge: {
-          y: 12,
-          x: 12,
-          h: 32,
+        w: EVENT_W,
+        h: EVENT_H,
+        CardBody: {
+          w: EVENT_W,
+          h: EVENT_H,
           rect: true,
-          color: 0xd9000000,
+          color: COLORS.BG_DARK,
           shader: {
             type: Lightning$1.shaders.RoundedRectangle,
             radius: BORDER_RADIUS.MEDIUM
           },
-          zIndex: 2,
-          Label: {
-            x: 12,
-            mountY: 0.5,
-            y: 17,
-            text: {
-              text: '',
-              fontSize: 18,
-              fontFace: TYPOGRAPHY.FONT_FAMILY,
-              textColor: COLORS.TEXT_WHITE
+          clipping: true,
+          VideoWrapper: {
+            x: 0,
+            y: 0,
+            w: EVENT_W,
+            h: 189,
+            type: VideoCard
+          },
+          TimeBadge: {
+            x: 10,
+            y: 10,
+            h: 28,
+            w: 92,
+            rect: true,
+            color: 0xd90a0a0c,
+            shader: {
+              type: Lightning$1.shaders.RoundedRectangle,
+              radius: BORDER_RADIUS.SMALL
+            },
+            zIndex: 2,
+            Label: {
+              x: 10,
+              mountY: 0.5,
+              y: 15,
+              text: {
+                text: '',
+                fontSize: 16,
+                fontStyle: 'bold',
+                fontFace: TYPOGRAPHY.FONT_FAMILY,
+                textColor: COLORS.TEXT_WHITE
+              }
+            }
+          },
+          MetaArea: {
+            x: 0,
+            y: 189,
+            w: EVENT_W,
+            h: 65,
+            rect: true,
+            color: COLORS.BG_CARD,
+            Title: {
+              x: 12,
+              y: 9,
+              w: EVENT_W - 24,
+              text: {
+                text: '',
+                fontSize: 18,
+                fontFace: TYPOGRAPHY.FONT_FAMILY,
+                textColor: COLORS.TEXT_LIGHT,
+                maxLines: 2,
+                textOverflow: 'ellipsis',
+                wordWrapWidth: EVENT_W - 24,
+                lineHeight: 23
+              }
             }
           }
         },
-        Title: {
-          y: 230,
-          x: 16,
-          w: 348,
-          text: {
-            text: '',
-            fontSize: 22,
-            fontFace: TYPOGRAPHY.FONT_FAMILY,
-            textColor: COLORS.TEXT_WHITE,
-            maxLines: 2,
-            textOverflow: 'ellipsis',
-            wordWrapWidth: 348,
-            lineHeight: 28
+        FocusRing: {
+          alpha: 0,
+          x: -3,
+          y: -3,
+          w: EVENT_W + 6,
+          h: EVENT_H + 6,
+          rect: true,
+          color: COLORS.TRANSPARENT,
+          shader: {
+            type: Lightning$1.shaders.RoundedRectangle,
+            radius: BORDER_RADIUS.LARGE,
+            stroke: 4,
+            strokeColor: COLORS.FOCUS_WHITE
           }
         }
       };
@@ -8405,73 +8864,87 @@ var APP_com_domain_app_ZappingStream = (function () {
     set item(data) {
       this._item = data;
       const ev = data.ev;
-        data.navigateYouTube;
-        const onVideoError = data.onVideoError;
-
-      // Formateo de fecha
-      const formatTime = dateStr => {
-        if (!dateStr) return "??:??";
-        const d = new Date(dateStr);
-        return isNaN(d.getTime()) ? "??:??" : d.toLocaleTimeString('es-AR', {
-          hour: '2-digit',
-          minute: '2-digit',
-          hour12: false
-        });
-      };
-      const start = formatTime(ev.ActualStartTime || ev.ScheduledStartTime || ev.AddedAt);
+      const start = formatTimeOnly(ev.EffectiveStartTime || ev.ScheduledStartTime);
       let timeText = start;
       if (ev.IsPast && !ev.Live) {
         const endStr = ev.ActualEndTime || ev.EndedAt;
-        const end = endStr ? formatTime(endStr) : "??:??";
-        timeText = "".concat(start, " - ").concat(end);
+        if (endStr) {
+          timeText = "".concat(start, " - ").concat(formatTimeOnly(endStr));
+        }
+      } else if (ev.Live) {
+        timeText = "\u25CF ".concat(start);
       }
-      const isNotNow = !ev.Live;
-      this.tag('TimeBadge').color = isNotNow ? COLORS.BG_DARK : COLORS.LIVE_BADGE;
-      this.tag('TimeBadge.Label').text.text = timeText;
-      this.tag('TimeBadge.Label').text.textColor = isNotNow ? COLORS.TEXT_GRAY : COLORS.TEXT_WHITE;
-
-      // Ajustar dinámicamente el ancho del badge en base al texto
-      this.tag('TimeBadge').w = Math.max(timeText.length * 12 + 30, 80);
-      const rawImageUrl = ev.ThumbnailUrl || ev.channel.ChannelImgUrl;
-      this.tag('VideoWrapper').item = {
-        imageUrl: rawImageUrl ? getFreshImage(rawImageUrl, ev.channel.LastActivityAt) : undefined,
+      const badgeW = Math.max(timeText.length * 10 + 20, 74);
+      this.tag('CardBody.TimeBadge').patch({
+        w: badgeW,
+        color: ev.Live ? COLORS.NETFLIX_RED : 0xd90a0a0c,
+        Label: {
+          text: {
+            text: timeText,
+            textColor: COLORS.TEXT_WHITE
+          }
+        }
+      });
+      const rawImageUrl = ev.ThumbnailUrl || ev.channel.ChannelImgUrl || '';
+      this.tag('CardBody.VideoWrapper').item = {
+        imageUrl: rawImageUrl,
+        cacheKey: ev.Live ? ev.channel.LastActivityAt : '',
         altText: ev.Title,
         fallbackText: ev.channel.ChannelName,
-        isLive: ev.Live,
-        isPremiere: ev.IsPremiere || ev.WasPremiere,
-        isPast: ev.IsPast && !ev.Live,
-        isUpcoming: !ev.IsPast && !ev.Live,
-        onImageError: () => onVideoError(ev.VideoId)
+        isLive: Boolean(ev.Live),
+        isPremiere: Boolean(ev.IsPremiere || ev.WasPremiere),
+        isPast: Boolean(ev.IsPast && !ev.Live),
+        isUpcoming: Boolean(!ev.IsPast && !ev.Live)
       };
-      this.tag('Title').text.text = ev.Title || 'Transmisión sin título';
+      this.tag('CardBody.MetaArea.Title').text.text = ev.Title || 'Transmisión programada';
     }
     _focus() {
       this.patch({
-        color: COLORS.BG_PANEL,
-        shader: {
-          type: Lightning$1.shaders.RoundedRectangle,
-          radius: BORDER_RADIUS.LARGE,
-          stroke: 4,
-          strokeColor: COLORS.ACCENT_BLUE
+        zIndex: 10,
+        smooth: {
+          scale: 1.03
         },
-        zIndex: 10
+        FocusRing: {
+          alpha: 1
+        },
+        CardBody: {
+          MetaArea: {
+            color: COLORS.BG_ELEVATED,
+            Title: {
+              text: {
+                textColor: COLORS.TEXT_WHITE
+              }
+            }
+          }
+        }
       });
     }
     _unfocus() {
       this.patch({
-        color: COLORS.BG_DARK,
-        shader: {
-          type: Lightning$1.shaders.RoundedRectangle,
-          radius: BORDER_RADIUS.LARGE,
-          stroke: 0
+        zIndex: 1,
+        smooth: {
+          scale: 1.0
         },
-        zIndex: 1
+        FocusRing: {
+          alpha: 0
+        },
+        CardBody: {
+          MetaArea: {
+            color: COLORS.BG_CARD,
+            Title: {
+              text: {
+                textColor: COLORS.TEXT_LIGHT
+              }
+            }
+          }
+        }
       });
     }
     _handleEnter() {
-      if (this._item.navigateYouTube) {
+      if (this._item && this._item.navigateYouTube && this._item.ev) {
         this._item.navigateYouTube("https://www.youtube.com/watch?v=".concat(this._item.ev.VideoId));
       }
+      return true;
     }
   }
 
@@ -8482,81 +8955,129 @@ var APP_com_domain_app_ZappingStream = (function () {
     static _template() {
       return {
         w: 1920,
-        h: 360,
-        // Altura fija de la fila
+        h: EVENT_H,
         Sidebar: {
-          w: 180,
-          h: 340,
-          rect: true,
-          color: COLORS.BG_BLACK,
-          Logo: {
-            x: 50,
-            y: 30,
-            w: COMPONENT_SIZE.LOGO_MEDIUM,
-            h: COMPONENT_SIZE.LOGO_MEDIUM,
-            shader: {
-              type: Lightning$1.shaders.RoundedRectangle,
-              radius: BORDER_RADIUS.CIRCLE
-            }
-          },
-          Name: {
-            x: 10,
-            y: 130,
-            w: 160,
-            text: {
-              text: '',
-              fontSize: 24,
-              fontFace: TYPOGRAPHY.FONT_FAMILY,
-              textColor: COLORS.ACCENT_BLUE,
-              wordWrapWidth: 160,
-              maxLines: 2,
-              textAlign: 'center',
-              lineHeight: 32
-            }
-          },
-          InfoBtn: {
-            x: 30,
-            y: 240,
-            w: 120,
-            h: 54,
+          x: SPACING.SAFE_X,
+          y: 0,
+          w: 224,
+          h: EVENT_H,
+          Card: {
+            w: 224,
+            h: EVENT_H,
             rect: true,
-            color: COLORS.BG_PANEL,
+            color: COLORS.BG_DARK,
             shader: {
               type: Lightning$1.shaders.RoundedRectangle,
-              radius: BORDER_RADIUS.PILL
+              radius: BORDER_RADIUS.MEDIUM
             },
-            Label: {
-              mount: 0.5,
-              x: 60,
-              y: 29,
-              text: {
-                text: 'Info',
-                fontSize: 22,
-                fontFace: TYPOGRAPHY.FONT_FAMILY,
-                textColor: COLORS.TEXT_WHITE
+            Logo: {
+              x: 80,
+              y: 22,
+              w: 64,
+              h: 64,
+              alpha: 0,
+              shader: {
+                type: Lightning$1.shaders.RoundedRectangle,
+                radius: 32
               }
+            },
+            LiveDot: {
+              alpha: 0,
+              x: 132,
+              y: 72,
+              w: 14,
+              h: 14,
+              rect: true,
+              color: COLORS.NETFLIX_RED,
+              shader: {
+                type: Lightning$1.shaders.RoundedRectangle,
+                radius: 7
+              }
+            },
+            Name: {
+              x: 14,
+              y: 100,
+              w: 196,
+              text: {
+                text: '',
+                fontSize: 20,
+                fontStyle: 'bold',
+                fontFace: TYPOGRAPHY.FONT_FAMILY,
+                textColor: COLORS.TEXT_WHITE,
+                wordWrapWidth: 196,
+                maxLines: 2,
+                textAlign: 'center',
+                lineHeight: 26,
+                textOverflow: 'ellipsis'
+              }
+            },
+            InfoPill: {
+              x: 24,
+              y: 192,
+              w: 176,
+              h: 40,
+              rect: true,
+              color: COLORS.BG_PANEL,
+              shader: {
+                type: Lightning$1.shaders.RoundedRectangle,
+                radius: BORDER_RADIUS.PILL
+              },
+              Label: {
+                mount: 0.5,
+                x: 88,
+                y: 21,
+                text: {
+                  text: 'Info canal',
+                  fontSize: 16,
+                  fontStyle: 'bold',
+                  fontFace: TYPOGRAPHY.FONT_FAMILY,
+                  textColor: COLORS.TEXT_GRAY
+                }
+              }
+            }
+          },
+          SidebarFocusRing: {
+            alpha: 0,
+            x: -3,
+            y: -3,
+            w: 230,
+            h: EVENT_H + 6,
+            rect: true,
+            color: COLORS.TRANSPARENT,
+            shader: {
+              type: Lightning$1.shaders.RoundedRectangle,
+              radius: BORDER_RADIUS.LARGE,
+              stroke: 4,
+              strokeColor: COLORS.FOCUS_WHITE
             }
           }
         },
-        // Slider horizontal de videos
         TrackBounds: {
-          x: 200,
-          y: -10,
-          w: 1720,
-          h: 380,
+          x: 308,
+          y: -8,
+          w: 1920 - 308 - SPACING.SAFE_X,
+          h: EVENT_H + 16,
           clipping: true,
           Slider: {
-            x: 0,
-            y: 10,
+            x: 8,
+            y: 8,
             Items: {}
           }
         }
       };
     }
     _construct() {
-      this._index = 1; // 0 = InfoBtn (Sidebar), 1 a N = Eventos
-      this._poolSize = 10;
+      this._index = 1; // 0 = Sidebar del canal, 1..N = Eventos
+      this._poolSize = 12;
       this._eventsPool = null;
+    }
+    _init() {
+      this.tag('Sidebar.Card.Logo').on('txLoaded', () => {
+        this.tag('Sidebar.Card.Logo').alpha = 1;
+      });
+      this.tag('Sidebar.Card.Logo').on('txError', () => {
+        this.tag('Sidebar.Card.Logo').alpha = 0;
+      });
     }
     _createPool() {
       if (!this._eventsPool) {
@@ -8575,24 +9096,32 @@ var APP_com_domain_app_ZappingStream = (function () {
     set item(data) {
       const isSameChannel = this._item && this._item.row.channel.ChannelName === data.row.channel.ChannelName;
       this._item = data;
-      const row = data.row;
-        data.navigateYouTube;
-        data.onVideoError;
-        const toggleInfo = data.toggleInfo;
-
-      // Configurar Sidebar
-      this.tag('Sidebar.Logo').src = row.channel.ChannelImgUrl;
-      this.tag('Sidebar.Name').text.text = row.channel.ChannelName;
-      this._toggleInfo = () => toggleInfo(row.channel.ChannelName);
-      this._eventsData = row.events;
+      const row = data.row,
+        toggleInfo = data.toggleInfo;
+      const logoSrc = row.channel.ChannelImgUrl ? getOptimizedImageUrl(row.channel.ChannelImgUrl, 128) : '';
+      if (logoSrc) {
+        if (this._lastLogoSrc !== logoSrc) {
+          this._lastLogoSrc = logoSrc;
+          this.tag('Sidebar.Card.Logo').alpha = 0.001;
+          this.tag('Sidebar.Card.Logo').src = logoSrc;
+        }
+      } else {
+        this._lastLogoSrc = '';
+        this.tag('Sidebar.Card.Logo').alpha = 0;
+      }
+      const hasLive = Boolean(row.events && row.events.some(e => e.Live));
+      this.tag('Sidebar.Card.LiveDot').alpha = hasLive ? 1 : 0;
+      this.tag('Sidebar.Card.Name').text.text = row.channel.ChannelName || '';
+      this._toggleInfo = () => {
+        if (toggleInfo) toggleInfo(row.channel);
+      };
+      this._eventsData = row.events || [];
       this._createPool();
-
-      // Auto-focus al primer video en vivo si existe, sino al primero normal
-      const liveIndex = row.events.findIndex(e => e.Live);
+      const liveIndex = this._eventsData.findIndex(e => e.Live);
       const defaultIndex = liveIndex !== -1 ? liveIndex + 1 : 1;
       if (isSameChannel) {
-        if (this._index > row.events.length) {
-          this._index = row.events.length;
+        if (this._index > this._eventsData.length) {
+          this._index = Math.max(1, this._eventsData.length);
         }
       } else {
         this._index = defaultIndex;
@@ -8602,49 +9131,72 @@ var APP_com_domain_app_ZappingStream = (function () {
         ev.alpha = 0;
         ev.x = -9999;
       });
-      this._updateScroll(true); // true = sin animación inicial
+      this._updateSidebarFocusVisual();
+      this._updateScroll(true);
+    }
+    _updateSidebarFocusVisual() {
+      const sidebarActive = this.hasFocus() && this._index === 0;
+      this.tag('Sidebar.SidebarFocusRing').alpha = sidebarActive ? 1 : 0;
+      this.tag('Sidebar.Card.InfoPill').color = sidebarActive ? COLORS.FOCUS_WHITE : COLORS.BG_PANEL;
+      this.tag('Sidebar.Card.InfoPill.Label').text.textColor = sidebarActive ? COLORS.BG_BLACK : COLORS.TEXT_GRAY;
+    }
+    _focus() {
+      this._updateSidebarFocusVisual();
+    }
+    _unfocus() {
+      this._updateSidebarFocusVisual();
     }
     _handleLeft() {
       if (this._index > 0) {
         this._index--;
-        this._updateScroll();
+        this._updateSidebarFocusVisual();
+        this._updateScroll(false);
         this._refocus();
         return true;
       }
-      return false; // Permite salir del EPG y volver al menú principal si hubiera uno
+      return false;
     }
     _handleRight() {
       if (this._eventsData && this._index < this._eventsData.length) {
         this._index++;
-        this._updateScroll();
+        this._updateSidebarFocusVisual();
+        this._updateScroll(false);
         this._refocus();
         return true;
       }
       return false;
     }
     _updateScroll() {
-      // Lógica de Sidebar Foco vs Video Foco
-      if (this._index === 0) {
-        // Foco en Botón Info
-        this.tag('Sidebar.InfoBtn').color = COLORS.ACCENT_BLUE;
-        this.tag('Sidebar.InfoBtn.Label').text.textColor = COLORS.BG_BLACK;
-      } else {
-        // Foco en Slider
-        this.tag('Sidebar.InfoBtn').color = COLORS.BG_PANEL;
-        this.tag('Sidebar.InfoBtn.Label').text.textColor = COLORS.TEXT_WHITE;
-        const evIndex = this._index - 1;
-        let targetX = 0;
-        if (evIndex > 0) {
-          targetX = -(evIndex * 400) + 60; // Desplazar exacto dejando 60px de margen respecto a la columna
-        }
-        this.tag('TrackBounds.Slider').x = targetX;
-      }
-
-      // Virtualización Horizontal
+      let instant = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : false;
       if (!this._eventsData || this._eventsData.length === 0) return;
       const evIndex = Math.max(0, this._index - 1);
-      const startIdx = Math.max(0, evIndex - 2);
-      const endIdx = Math.min(this._eventsData.length - 1, evIndex + 5);
+      const trackW = 1920 - 308 - SPACING.SAFE_X; // 1548px
+      const totalW = this._eventsData.length * EVENT_STEP - 20;
+      let targetX = 8;
+      if (this._index > 0 && totalW > trackW) {
+        const rawX = -(evIndex * EVENT_STEP) + 8;
+        const minX = trackW - totalW - 8;
+        targetX = Math.max(minX, Math.min(8, rawX));
+      }
+      if (instant) {
+        this.tag('TrackBounds.Slider').x = targetX;
+      } else {
+        this.tag('TrackBounds.Slider').patch({
+          smooth: {
+            x: [targetX, {
+              duration: 0.16
+            }]
+          }
+        });
+      }
+
+      // IMPORTANTE: Calculamos el rango visible [startIdx, endIdx] en base a targetX real del Slider
+      // (y no solo evIndex - 1), para que cuando el foco arranque en un vivo a la derecha o al final
+      // de la fila TODAS las tarjetas visibles a su izquierda se rendericen desde el primer cuadro.
+      const leftVisibleCoord = Math.max(0, -targetX);
+      const rightVisibleCoord = leftVisibleCoord + trackW;
+      const startIdx = Math.max(0, Math.floor(leftVisibleCoord / EVENT_STEP) - 1);
+      const endIdx = Math.min(this._eventsData.length - 1, Math.ceil(rightVisibleCoord / EVENT_STEP) + 1);
       this._eventsPool.forEach(ev => {
         if (ev._currentDataIdx !== -1 && (ev._currentDataIdx < startIdx || ev._currentDataIdx > endIdx)) {
           ev.alpha = 0;
@@ -8658,12 +9210,11 @@ var APP_com_domain_app_ZappingStream = (function () {
         const evComponent = this._eventsPool[poolIndex];
         if (evComponent._currentDataIdx !== i) {
           evComponent.patch({
-            x: i * 400,
+            x: i * EVENT_STEP,
             alpha: 1,
             item: {
               ev: data,
-              navigateYouTube: this._item.navigateYouTube,
-              onVideoError: this._item.onVideoError
+              navigateYouTube: this._item.navigateYouTube
             }
           });
           evComponent._currentDataIdx = i;
@@ -8671,7 +9222,7 @@ var APP_com_domain_app_ZappingStream = (function () {
       }
     }
     _getFocused() {
-      if (this._index === 0) return this; // La propia fila captura enter si estamos en el InfoBtn
+      if (this._index === 0) return this;
       if (!this._eventsData || this._eventsData.length === 0) return this;
       const evIndex = this._index - 1;
       const poolIndex = evIndex % this._poolSize;
@@ -8680,109 +9231,178 @@ var APP_com_domain_app_ZappingStream = (function () {
     _handleEnter() {
       if (this._index === 0 && this._toggleInfo) {
         this._toggleInfo();
+        return true;
       }
+      return false;
     }
   }
 
   // ==========================================
-  // 4. Grilla Principal de Horarios (Main Grid)
+  // 4. Guía Principal de Transmisiones (ScheduleGrid)
   // ==========================================
   class ScheduleGrid extends Lightning$1.Component {
     static _template() {
       return {
         w: 1920,
-        h: 1080,
+        h: 936,
         alpha: 1,
-        // Selector de Días Horizontal
         DaysRailBounds: {
-          x: 60,
-          y: 20,
-          w: 1800,
-          h: 80,
+          x: SPACING.SAFE_X,
+          y: 14,
+          w: 1920 - SPACING.SAFE_X * 2,
+          h: 62,
           clipping: true,
           Slider: {
             x: 0,
-            y: 0,
+            y: 6,
             Items: {}
           }
         },
-        // Mensaje de Vacío
-        NoEventsMsg: {
+        StateMsg: {
           alpha: 0,
           mount: 0.5,
           x: 960,
-          y: 540,
+          y: 460,
           text: {
             text: 'No hay transmisiones programadas para este día.',
-            fontSize: 36,
+            fontSize: 30,
             fontFace: TYPOGRAPHY.FONT_FAMILY,
             textColor: COLORS.TEXT_GRAY
           }
         },
-        // Contenedor Vertical de Canales
         EpgContainerBounds: {
           x: 0,
-          y: 110,
+          y: 88,
           w: 1920,
-          h: 820,
+          h: 840,
           clipping: true,
           Slider: {
             x: 0,
-            y: 0,
+            y: 4,
             Items: {}
           }
         }
       };
     }
     _construct() {
-      this._focusY = 0; // 0 = DaysRail, 1 a N = Filas de Canales
-      this._dayIndex = 0; // Indice del día seleccionado visualmente
-      this._failedVideos = new Set();
-      this._failedChannels = new Set();
-      this._rowsComponents = null; // Lo inicializamos null
-
-      // Configuración de los 15 días (-7 a +7)
+      this._focusY = 0; // 0 = Selector de días, 1..N = Filas de canales
+      this._dayIndex = 7;
+      this._rowsComponents = null;
+      this._rowsData = [];
+      this._validationSeq = 0;
+      this._isValidatingDay = false;
       this._today = new Date();
       this._today.setHours(0, 0, 0, 0);
       this._selectedDate = new Date(this._today);
       this._days = [];
       for (let i = -7; i <= 7; i++) {
-        const d = new Date();
-        d.setDate(d.getDate() + i);
+        const d = new Date(this._today);
+        d.setDate(this._today.getDate() + i);
         d.setHours(0, 0, 0, 0);
         this._days.push(d);
         if (d.getTime() === this._today.getTime()) {
-          this._dayIndex = i + 7; // El índice inicial seleccionado será el "Hoy"
+          this._dayIndex = i + 7;
         }
       }
     }
     _init() {
-      const daysItems = [];
-      let currentX = 0;
-      this._days.forEach((d, i) => {
+      const daysItems = this._days.map((d, i) => {
         let label = d.toLocaleDateString('es-AR', {
           weekday: 'short',
           day: 'numeric',
           month: 'numeric'
         });
         if (d.getTime() === this._today.getTime()) {
-          label = "Hoy";
+          label = 'Hoy';
         }
-        daysItems.push({
+        return {
           type: DayButton,
-          x: currentX,
+          x: i * DAY_BTN_STEP,
           item: {
             date: d,
             label
           }
-        });
-        currentX += 212; // 200 de ancho + 12 de gap
+        };
       });
       this.tag('DaysRailBounds.Slider.Items').children = daysItems;
       this._dayButtons = this.tag('DaysRailBounds.Slider.Items').children;
+      this._centerDaySlider(true);
     }
+    _centerDaySlider() {
+      let instant = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : false;
+      const railW = 1920 - SPACING.SAFE_X * 2;
+      const totalW = this._days.length * DAY_BTN_STEP - 14;
+      const centerOffset = Math.round((railW - DAY_BTN_W) / 2);
+      const rawX = -(this._dayIndex * DAY_BTN_STEP) + centerOffset;
+      const minX = railW - totalW;
+      const targetX = Math.max(minX, Math.min(0, rawX));
+      if (instant) {
+        this.tag('DaysRailBounds.Slider').x = targetX;
+      } else {
+        this.tag('DaysRailBounds.Slider').patch({
+          smooth: {
+            x: [targetX, {
+              duration: 0.16
+            }]
+          }
+        });
+      }
+    }
+    _channelHasEventsOnDate(channel, dateObj) {
+      const buckets = [channel.Actives, channel.Upcoming, channel.Past];
+      for (let b = 0; b < buckets.length; b++) {
+        const bucket = buckets[b];
+        if (!bucket) continue;
+        const vals = Object.values(bucket);
+        for (let i = 0; i < vals.length; i++) {
+          const v = vals[i];
+          if (!v || !v.VideoId) continue;
+          const ds = v.EffectiveStartTime || v.ActualStartTime || v.ScheduledStartTime || v.AddedAt;
+          if (!ds) continue;
+          const parsed = new Date(ds);
+          if (!isNaN(parsed.getTime()) && isSameLocalDay(parsed, dateObj)) {
+            return true;
+          }
+        }
+      }
+      return false;
+    }
+    _pickBestDayForChannels(channels) {
+      if (!channels || channels.length === 0) return null;
+      const hasOnDay = dateObj => channels.some(ch => this._channelHasEventsOnDate(ch, dateObj));
 
-    // Equivalente a Props de React
+      // 1. Priorizar Hoy si tiene eventos
+      if (hasOnDay(this._today)) {
+        return {
+          date: new Date(this._today),
+          dayIdx: 7
+        };
+      }
+
+      // 2. Buscar el día pasado más reciente con transmisiones (ayer -> hace 7 días)
+      for (let idx = 6; idx >= 0; idx--) {
+        if (hasOnDay(this._days[idx])) {
+          return {
+            date: new Date(this._days[idx]),
+            dayIdx: idx
+          };
+        }
+      }
+
+      // 3. Si no hay pasadas, buscar la próxima fecha futura más cercana
+      for (let idx = 8; idx < this._days.length; idx++) {
+        if (hasOnDay(this._days[idx])) {
+          return {
+            date: new Date(this._days[idx]),
+            dayIdx: idx
+          };
+        }
+      }
+      return {
+        date: new Date(this._today),
+        dayIdx: 7
+      };
+    }
     set config(data) {
       this._channels = data.channels || [];
       this._navigateYouTube = data.navigateYouTube;
@@ -8790,72 +9410,85 @@ var APP_com_domain_app_ZappingStream = (function () {
       this._abrirCanal = data.abrirCanal;
       this._abrirCanalOnStreams = data.abrirCanalOnStreams;
       this._abrirCanalOnDemand = data.abrirCanalOnDemand;
-
-      // Reactividad a ExpandedChannels
-      if (data.expandedChannels && data.expandedChannels.size > 0) {
-        // Obtener el primer canal expandido (en la app TV no se abren múltiples a la vez normalmente)
-        const channelName = Array.from(data.expandedChannels)[0];
-        const channel = this._channels.find(c => c.ChannelName === channelName);
-        if (channel) {
-          this.fireAncestors('$openExpandedModal', channel); // Emitimos para que App.js lo muestre en overlay completo
+      if (data.autoFocusBestDay) {
+        const best = this._pickBestDayForChannels(this._channels);
+        if (best) {
+          this._selectedDate = best.date;
+          this._dayIndex = best.dayIdx;
+          this._centerDaySlider(true);
+        }
+        this._pendingAutoFocusRow = true;
+      }
+      this._prepareAndBuildSelectedDay();
+    }
+    async _prepareAndBuildSelectedDay() {
+      const seq = ++this._validationSeq;
+      const targetDate = this._selectedDate;
+      if (this._dayButtons) {
+        this._dayButtons.forEach((btn, idx) => {
+          btn.isSelected = this._days[idx].getTime() === targetDate.getTime();
+        });
+      }
+      if (!isDatePrevalidated(targetDate) && this._channels && this._channels.length > 0) {
+        this._isValidatingDay = true;
+        this.tag('EpgContainerBounds').alpha = 0;
+        this.tag('StateMsg').patch({
+          alpha: 1,
+          text: {
+            text: 'Verificando transmisiones disponibles...'
+          }
+        });
+        const _await$ensureDateChan = await ensureDateChannelsValidated(this._channels, targetDate),
+          cleaned = _await$ensureDateChan.channels,
+          removedCount = _await$ensureDateChan.removedCount;
+        if (seq !== this._validationSeq) return;
+        this._isValidatingDay = false;
+        this._channels = cleaned;
+        if (removedCount > 0) {
+          this.fireAncestors('$onChannelsSanitized');
         }
       }
+      if (seq !== this._validationSeq) return;
+      this._isValidatingDay = false;
       this._buildGrid();
     }
-
-    // Filtra y genera los datos (Equivalente al useMemo de channelRows en React)
     _buildGrid() {
-      var _this = this;
       const rowsData = [];
+      const selectedDate = this._selectedDate;
       this._channels.forEach(channel => {
-        if (this._failedChannels.has(channel.ChannelName)) return;
         const events = [];
-        const checkAndAddEvent = function (v) {
-          let isForceLive = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : false;
-          if (_this._failedVideos.has(v.VideoId)) return;
-          const isLive = v.Live || isForceLive;
-          const effectiveStartTime = v.ActualStartTime || v.ScheduledStartTime || v.AddedAt;
-          if (effectiveStartTime) {
-            const vDate = new Date(effectiveStartTime);
-            if (vDate.getFullYear() === _this._selectedDate.getFullYear() && vDate.getMonth() === _this._selectedDate.getMonth() && vDate.getDate() === _this._selectedDate.getDate()) {
-              if (!events.some(e => e.VideoId === v.VideoId)) {
-                events.push({
-                  ...v,
-                  ScheduledStartTime: effectiveStartTime,
-                  Live: isLive,
-                  channel
-                });
-              }
-            }
-          }
-        };
-        if (channel.Upcoming) Object.values(channel.Upcoming).filter(v => v.ScheduledStartTime).forEach(v => checkAndAddEvent(v, false));
-        if (channel.Actives) Object.values(channel.Actives).forEach(v => checkAndAddEvent(v, true));
-        if (channel.Past) {
-          Object.values(channel.Past).forEach(v => {
-            const effectiveStartTime = v.ActualStartTime || v.ScheduledStartTime || v.AddedAt;
-            if (!effectiveStartTime || this._failedVideos.has(v.VideoId)) return;
-            const vDate = new Date(effectiveStartTime);
-            if (!isNaN(vDate.getTime()) && vDate.toDateString() === this._selectedDate.toDateString()) {
-              if (!events.some(e => e.VideoId === v.VideoId)) {
-                events.push({
-                  ...v,
-                  ScheduledStartTime: effectiveStartTime,
-                  Live: false,
-                  IsPast: true,
-                  channel
-                });
-              }
-            }
+        const seenIds = new Set();
+        const tryPush = (v, isLive, isPast) => {
+          if (!v || !v.VideoId || seenIds.has(v.VideoId)) return;
+          const effectiveStart = v.EffectiveStartTime || v.ActualStartTime || v.ScheduledStartTime || v.AddedAt;
+          if (!effectiveStart) return;
+          const vDate = new Date(effectiveStart);
+          if (isNaN(vDate.getTime()) || !isSameLocalDay(vDate, selectedDate)) return;
+          seenIds.add(v.VideoId);
+          events.push({
+            ...v,
+            EffectiveStartTime: effectiveStart,
+            ScheduledStartTime: effectiveStart,
+            Live: isLive,
+            IsPast: isPast,
+            channel
           });
+        };
+        if (channel.Actives) {
+          Object.values(channel.Actives).forEach(v => tryPush(v, true, false));
+        }
+        if (channel.Upcoming) {
+          Object.values(channel.Upcoming).forEach(v => tryPush(v, Boolean(v.Live), false));
+        }
+        if (channel.Past) {
+          Object.values(channel.Past).forEach(v => tryPush(v, false, true));
         }
         if (events.length > 0) {
-          const getTime = dateStr => {
-            if (!dateStr) return new Date().getTime();
-            const t = new Date(dateStr).getTime();
-            return isNaN(t) ? new Date().getTime() : t;
-          };
-          events.sort((a, b) => getTime(a.ScheduledStartTime) - getTime(b.ScheduledStartTime));
+          events.sort((a, b) => {
+            const ta = new Date(a.EffectiveStartTime).getTime() || 0;
+            const tb = new Date(b.EffectiveStartTime).getTime() || 0;
+            return ta - tb;
+          });
           rowsData.push({
             channel,
             events
@@ -8863,10 +9496,19 @@ var APP_com_domain_app_ZappingStream = (function () {
         }
       });
       rowsData.sort((a, b) => a.channel.ChannelName.localeCompare(b.channel.ChannelName));
-      this._rowsData = rowsData; // Guardamos ref para virtualizar
-
-      // Dibujar Filas
-      this.tag('NoEventsMsg').alpha = rowsData.length === 0 ? 1 : 0;
+      this._rowsData = rowsData;
+      if (rowsData.length === 0) {
+        this.tag('EpgContainerBounds').alpha = 0;
+        this.tag('StateMsg').patch({
+          alpha: 1,
+          text: {
+            text: 'No hay transmisiones programadas para este día.'
+          }
+        });
+      } else {
+        this.tag('StateMsg').alpha = 0;
+        this.tag('EpgContainerBounds').alpha = 1;
+      }
       if (!this._rowsComponents) {
         this._poolSize = 8;
         const rowItems = [];
@@ -8880,87 +9522,93 @@ var APP_com_domain_app_ZappingStream = (function () {
         this.tag('EpgContainerBounds.Slider.Items').children = rowItems;
         this._rowsComponents = this.tag('EpgContainerBounds.Slider.Items').children;
       }
-
-      // Resetear pool para forzar render
       this._rowsComponents.forEach(row => {
         row._currentDataIdx = -1;
         row.alpha = 0;
         row.y = -9999;
       });
-
-      // Actualizar visualmente la selección de días
-      if (this._dayButtons) {
-        this._dayButtons.forEach((btn, idx) => {
-          btn.isSelected = this._days[idx].getTime() === this._selectedDate.getTime();
-        });
-      }
-
-      // Ajustar el foco si nos quedamos sin filas por el filtrado
-      if (this._focusY > this._rowsData.length) {
+      if (this._pendingAutoFocusRow) {
+        this._pendingAutoFocusRow = false;
+        this._focusY = this._rowsData.length > 0 ? 1 : 0;
+      } else if (this._focusY > this._rowsData.length) {
         this._focusY = this._rowsData.length;
       }
-      this._updateScrollVertical();
+      this._updateScrollVertical(true);
+      if (this.hasFocus()) {
+        this._refocus();
+      }
     }
-
-    // Evento Escuchado desde DayButton
     $onDaySelected(date) {
       this._selectedDate = date;
-      this._buildGrid();
+      this._focusY = 0;
+      this._prepareAndBuildSelectedDay();
     }
-
-    // --- Manejo del Foco Vertical de la Pantalla ---
     _handleUp() {
       if (this._focusY > 0) {
         this._focusY--;
-        this._updateScrollVertical();
+        this._updateScrollVertical(false);
         this._refocus();
         return true;
       }
-      return false; // Escapa hacia AppHeader
+      return false;
     }
     _handleDown() {
+      if (this._isValidatingDay) return true;
       if (this._rowsData && this._focusY < this._rowsData.length) {
         this._focusY++;
-        this._updateScrollVertical();
+        this._updateScrollVertical(false);
         this._refocus();
         return true;
       }
-      return false; // Escapa hacia AppFooter
+      return true;
     }
     _handleLeft() {
       if (this._focusY === 0 && this._dayIndex > 0) {
         this._dayIndex--;
-        this.tag('DaysRailBounds.Slider').x = -(this._dayIndex * 212) + 500;
+        this._centerDaySlider(false);
         this._refocus();
         return true;
       }
       return false;
     }
     _handleRight() {
-      if (this._focusY === 0 && this._dayIndex < this._dayButtons.length - 1) {
+      if (this._focusY === 0 && this._dayButtons && this._dayIndex < this._dayButtons.length - 1) {
         this._dayIndex++;
-        this.tag('DaysRailBounds.Slider').x = -(this._dayIndex * 212) + 500;
+        this._centerDaySlider(false);
         this._refocus();
         return true;
       }
       return false;
     }
     _updateScrollVertical() {
+      let instant = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : false;
       const rowIndex = Math.max(0, this._focusY - 1);
-      if (this._focusY > 0) {
-        let targetY = 0;
-        if (rowIndex > 1) {
-          targetY = -((rowIndex - 1) * 360); // Altura de fila: 360px
-        }
+      const viewportH = 840;
+      const totalH = this._rowsData.length * ROW_STRIDE - 22;
+      let targetY = 4;
+      if (this._focusY > 0 && totalH > viewportH) {
+        const rawY = -(rowIndex * ROW_STRIDE) + 4;
+        const minY = viewportH - totalH - 12;
+        targetY = Math.max(minY, Math.min(4, rawY));
+      }
+      if (instant) {
         this.tag('EpgContainerBounds.Slider').y = targetY;
       } else {
-        this.tag('EpgContainerBounds.Slider').y = 0;
+        this.tag('EpgContainerBounds.Slider').patch({
+          smooth: {
+            y: [targetY, {
+              duration: 0.16
+            }]
+          }
+        });
       }
-
-      // Virtualización vertical
       if (!this._rowsData || this._rowsData.length === 0) return;
-      const startIdx = Math.max(0, rowIndex - 2);
-      const endIdx = Math.min(this._rowsData.length - 1, rowIndex + 4);
+
+      // Rango vertical visible calculado en base a targetY real del Slider
+      const topVisibleCoord = Math.max(0, -targetY);
+      const bottomVisibleCoord = topVisibleCoord + viewportH;
+      const startIdx = Math.max(0, Math.floor(topVisibleCoord / ROW_STRIDE) - 1);
+      const endIdx = Math.min(this._rowsData.length - 1, Math.ceil(bottomVisibleCoord / ROW_STRIDE) + 1);
       this._rowsComponents.forEach(row => {
         if (row._currentDataIdx !== -1 && (row._currentDataIdx < startIdx || row._currentDataIdx > endIdx)) {
           row.alpha = 0;
@@ -8974,16 +9622,12 @@ var APP_com_domain_app_ZappingStream = (function () {
         const row = this._rowsComponents[poolIndex];
         if (row._currentDataIdx !== i) {
           row.patch({
-            y: i * 360,
+            y: i * ROW_STRIDE,
             alpha: 1,
             item: {
               row: data,
               navigateYouTube: this._navigateYouTube,
-              toggleInfo: this._toggleInfo,
-              onVideoError: videoId => {
-                this._failedVideos.add(videoId);
-                this._buildGrid();
-              }
+              toggleInfo: this._toggleInfo
             }
           });
           row._currentDataIdx = i;
@@ -8991,9 +9635,10 @@ var APP_com_domain_app_ZappingStream = (function () {
       }
     }
     _getFocused() {
-      if (this._focusY === 0) {
-        return this._dayButtons[this._dayIndex]; // Selector de Días
-      } else if (this._rowsData && this._rowsData.length > 0) {
+      if (this._focusY === 0 || this._isValidatingDay) {
+        return this._dayButtons && this._dayButtons[this._dayIndex] || this;
+      }
+      if (this._rowsData && this._rowsData.length > 0) {
         const dataIdx = this._focusY - 1;
         const poolIndex = dataIdx % this._poolSize;
         return this._rowsComponents[poolIndex];
@@ -9002,34 +9647,309 @@ var APP_com_domain_app_ZappingStream = (function () {
     }
   }
 
+  class ChannelCard extends Lightning$1.Component {
+    static _template() {
+      return {
+        w: COMPONENT_SIZE.CARD_WIDTH,
+        h: COMPONENT_SIZE.CARD_HEIGHT,
+        Body: {
+          w: COMPONENT_SIZE.CARD_WIDTH,
+          h: COMPONENT_SIZE.CARD_HEIGHT,
+          rect: true,
+          color: COLORS.BG_DARK,
+          shader: {
+            type: Lightning$1.shaders.RoundedRectangle,
+            radius: BORDER_RADIUS.MEDIUM
+          },
+          clipping: true,
+          Thumb: {
+            x: 0,
+            y: 0,
+            w: COMPONENT_SIZE.CARD_WIDTH,
+            h: 191,
+            type: VideoCard
+          },
+          MultiStreamBadge: {
+            alpha: 0,
+            x: 10,
+            y: 10,
+            h: 26,
+            w: 112,
+            rect: true,
+            color: 0xd90a0a0c,
+            shader: {
+              type: Lightning$1.shaders.RoundedRectangle,
+              radius: BORDER_RADIUS.SMALL
+            },
+            Label: {
+              mount: 0.5,
+              x: 56,
+              y: 14,
+              text: {
+                text: '',
+                fontSize: 14,
+                fontStyle: 'bold',
+                fontFace: TYPOGRAPHY.FONT_FAMILY,
+                textColor: COLORS.TEXT_WHITE
+              }
+            }
+          },
+          MetaStrip: {
+            x: 0,
+            y: 191,
+            w: COMPONENT_SIZE.CARD_WIDTH,
+            h: 57,
+            rect: true,
+            color: COLORS.BG_CARD,
+            Logo: {
+              x: 12,
+              y: 12,
+              w: 33,
+              h: 33,
+              alpha: 0,
+              shader: {
+                type: Lightning$1.shaders.RoundedRectangle,
+                radius: 17
+              }
+            },
+            ChannelTitle: {
+              x: 54,
+              y: 7,
+              text: {
+                text: '',
+                fontSize: 19,
+                fontStyle: 'bold',
+                fontFace: TYPOGRAPHY.FONT_FAMILY,
+                textColor: COLORS.TEXT_WHITE,
+                maxLines: 1,
+                wordWrapWidth: 274,
+                textOverflow: 'ellipsis'
+              }
+            },
+            Subtitle: {
+              x: 54,
+              y: 31,
+              text: {
+                text: '',
+                fontSize: 16,
+                fontFace: TYPOGRAPHY.FONT_FAMILY,
+                textColor: COLORS.TEXT_GRAY,
+                maxLines: 1,
+                wordWrapWidth: 274,
+                textOverflow: 'ellipsis'
+              }
+            }
+          }
+        },
+        // Anillo de foco pre-instanciado (evita recompilar shaders al navegar con el control)
+        FocusRing: {
+          alpha: 0,
+          x: -3,
+          y: -3,
+          w: COMPONENT_SIZE.CARD_WIDTH + 6,
+          h: COMPONENT_SIZE.CARD_HEIGHT + 6,
+          rect: true,
+          color: COLORS.TRANSPARENT,
+          shader: {
+            type: Lightning$1.shaders.RoundedRectangle,
+            radius: BORDER_RADIUS.LARGE,
+            stroke: 4,
+            strokeColor: COLORS.FOCUS_WHITE
+          }
+        }
+      };
+    }
+    _init() {
+      this.tag('Body.MetaStrip.Logo').on('txLoaded', () => {
+        this.tag('Body.MetaStrip.Logo').alpha = 1;
+      });
+      this.tag('Body.MetaStrip.Logo').on('txError', () => {
+        this.tag('Body.MetaStrip.Logo').alpha = 0;
+      });
+    }
+    set item(data) {
+      this._item = data;
+      this._updateLayout();
+    }
+    get item() {
+      return this._item;
+    }
+    _updateLayout() {
+      if (!this._item || !this._item.channel) return;
+      const _this$_item = this._item,
+        channel = _this$_item.channel,
+        isLiveGroup = _this$_item.isLiveGroup;
+      const activeVideos = isLiveGroup ? channel.ActiveList || Object.values(channel.Actives || {}) : [];
+      this._activeVideos = activeVideos;
+      const mainActive = activeVideos.length > 0 ? activeVideos[0] : null;
+
+      // Miniatura 16:9
+      let rawThumb = channel.ChannelImgUrl || '';
+      if (isLiveGroup && mainActive) {
+        rawThumb = mainActive.ThumbnailUrl || channel.ChannelImgUrl || '';
+      } else if (!isLiveGroup && channel.ChannelBannerUrl) {
+        rawThumb = "".concat(channel.ChannelBannerUrl, "=w640-fcrop64=1,00005a57ffffa5a8-k-c0xffffffff-no-nd-rj");
+      }
+      this.tag('Body.Thumb').item = {
+        imageUrl: rawThumb,
+        cacheKey: isLiveGroup && mainActive ? channel.LastActivityAt : '',
+        altText: mainActive ? mainActive.Title : channel.ChannelName,
+        fallbackText: channel.ChannelName,
+        isLive: Boolean(isLiveGroup && mainActive && mainActive.Live !== false),
+        isPremiere: Boolean(mainActive && mainActive.IsPremiere)
+      };
+
+      // Indicador de múltiples transmisiones simultáneas
+      if (isLiveGroup && activeVideos.length > 1) {
+        const text = "".concat(activeVideos.length, " EN VIVO");
+        const w = text.length * 8 + 24;
+        this.tag('Body.MultiStreamBadge').patch({
+          alpha: 1,
+          w,
+          Label: {
+            x: w / 2,
+            text: {
+              text
+            }
+          }
+        });
+      } else {
+        this.tag('Body.MultiStreamBadge').alpha = 0;
+      }
+
+      // Logo pequeño + Textos inferiores
+      const logoUrl = channel.ChannelImgUrl ? getOptimizedImageUrl(channel.ChannelImgUrl, 80) : '';
+      if (logoUrl) {
+        if (this._lastLogoUrl !== logoUrl) {
+          this._lastLogoUrl = logoUrl;
+          this.tag('Body.MetaStrip.Logo').alpha = 0.001;
+          this.tag('Body.MetaStrip.Logo').src = logoUrl;
+        }
+        this.tag('Body.MetaStrip.ChannelTitle').x = 54;
+        this.tag('Body.MetaStrip.Subtitle').x = 54;
+        this.tag('Body.MetaStrip.ChannelTitle').text.wordWrapWidth = 274;
+        this.tag('Body.MetaStrip.Subtitle').text.wordWrapWidth = 274;
+      } else {
+        this._lastLogoUrl = '';
+        this.tag('Body.MetaStrip.Logo').alpha = 0;
+        this.tag('Body.MetaStrip.ChannelTitle').x = 14;
+        this.tag('Body.MetaStrip.Subtitle').x = 14;
+        this.tag('Body.MetaStrip.ChannelTitle').text.wordWrapWidth = 312;
+        this.tag('Body.MetaStrip.Subtitle').text.wordWrapWidth = 312;
+      }
+      this.tag('Body.MetaStrip.ChannelTitle').text.text = channel.ChannelName || '';
+      if (isLiveGroup && mainActive) {
+        this.tag('Body.MetaStrip.Subtitle').text.text = mainActive.Title || 'En vivo ahora';
+      } else {
+        this.tag('Body.MetaStrip.Subtitle').text.text = channel.ChannelCity ? "\uD83D\uDCCD ".concat(channel.ChannelCity) : 'Ver transmisiones';
+      }
+    }
+    _focus() {
+      this.patch({
+        zIndex: 10,
+        smooth: {
+          scale: 1.05
+        },
+        FocusRing: {
+          alpha: 1
+        },
+        Body: {
+          MetaStrip: {
+            color: COLORS.BG_ELEVATED,
+            Subtitle: {
+              text: {
+                textColor: COLORS.TEXT_LIGHT
+              }
+            }
+          }
+        }
+      });
+      if (this._item && this._item.channel) {
+        this.fireAncestors('$onChannelFocused', this._item.channel);
+      }
+    }
+    _unfocus() {
+      this.patch({
+        zIndex: 1,
+        smooth: {
+          scale: 1.0
+        },
+        FocusRing: {
+          alpha: 0
+        },
+        Body: {
+          MetaStrip: {
+            color: COLORS.BG_CARD,
+            Subtitle: {
+              text: {
+                textColor: COLORS.TEXT_GRAY
+              }
+            }
+          }
+        }
+      });
+    }
+    _handleEnter() {
+      if (!this._item) return true;
+      const _this$_item2 = this._item,
+        channel = _this$_item2.channel,
+        isLiveGroup = _this$_item2.isLiveGroup,
+        abrirCanal = _this$_item2.abrirCanal,
+        abrirCanalOnStreams = _this$_item2.abrirCanalOnStreams;
+      if (isLiveGroup) {
+        if (this._activeVideos && this._activeVideos.length > 1) {
+          this.fireAncestors('$onSelectStream', {
+            channel,
+            activeVideos: this._activeVideos
+          });
+        } else if (abrirCanal) {
+          abrirCanal(channel);
+        }
+      } else if (abrirCanalOnStreams) {
+        abrirCanalOnStreams(channel);
+      }
+      return true;
+    }
+  }
+
+  const CARD_STEP = COMPONENT_SIZE.CARD_WIDTH + SPACING.GAP_LARGE; // 340 + 24 = 364px
+
   class ChannelCategoryRow extends Lightning$1.Component {
     static _template() {
       return {
         w: 1920,
-        h: 400,
-        // Altura: título + tarjetas
+        h: 304,
         alpha: 1,
+        AccentTick: {
+          x: SPACING.SAFE_X,
+          y: 5,
+          w: 5,
+          h: 24,
+          rect: true,
+          color: COLORS.NETFLIX_RED,
+          alpha: 0.7
+        },
         Title: {
-          x: 60,
+          x: SPACING.SAFE_X + 14,
           y: 0,
           text: {
             text: '',
-            fontSize: 36,
+            fontSize: 26,
+            fontStyle: 'bold',
             fontFace: TYPOGRAPHY.FONT_FAMILY,
-            textColor: COLORS.ACCENT_BLUE
+            textColor: COLORS.TEXT_LIGHT
           }
         },
-        // Contenedor que moveremos hacia los lados para simular el scroll
         Slider: {
-          x: 60,
-          y: 60,
+          x: SPACING.SAFE_X,
+          y: 44,
           Items: {}
         }
       };
     }
     _init() {
-      this._index = 0; // Índice de la tarjeta enfocada
-      this._poolSize = 15; // Pool de tarjetas reciclables
+      this._index = 0;
+      this._poolSize = 12;
       const items = [];
       for (let i = 0; i < this._poolSize; i++) {
         items.push({
@@ -9040,14 +9960,10 @@ var APP_com_domain_app_ZappingStream = (function () {
       }
       this.tag('Slider.Items').children = items;
       this._cardsPool = this.tag('Slider.Items').children;
-      this._failedVideos = new Set();
     }
-
-    // Setter que reemplaza los "props" de React
     set category(data) {
       const title = data.title,
         channels = data.channels,
-        expandedChannels = data.expandedChannels,
         toggleInfo = data.toggleInfo,
         abrirCanal = data.abrirCanal,
         abrirCanalOnStreams = data.abrirCanalOnStreams,
@@ -9055,89 +9971,59 @@ var APP_com_domain_app_ZappingStream = (function () {
         navigateYouTube = data.navigateYouTube;
       if (!channels || channels.length === 0) {
         this.alpha = 0;
+        this._channelData = [];
         return;
       }
       this.alpha = 1;
-      this.tag('Title').text.text = title;
-      this._originalChannels = channels;
-      this._expandedChannels = expandedChannels;
-      this._isLiveGroup = title === 'AHORA';
+      this._isLiveGroup = title === 'AHORA' || title === 'EN VIVO AHORA';
+      const displayTitle = this._isLiveGroup ? 'En Vivo Ahora' : 'Canales On Demand';
+      this.tag('Title').text.text = "".concat(displayTitle, "  (").concat(channels.length, ")");
       this._callbacks = {
         toggleInfo,
         abrirCanal,
         abrirCanalOnStreams,
         abrirCanalOnDemand,
-        navigateYouTube,
-        onVideoError: videoId => this._handleVideoError(videoId)
+        navigateYouTube
       };
-
-      // Guardar el nombre del canal actualmente enfocado para no perder su posición
-      let currentFocusedChannel = null;
+      let currentFocusedName = null;
       if (this._channelData && this._channelData[this._index]) {
-        currentFocusedChannel = this._channelData[this._index].channel.ChannelName;
+        currentFocusedName = this._channelData[this._index].channel.ChannelName;
       }
-
-      // Limpiar el pool para forzar re-renderizado
+      this._channelData = channels.map((channel, i) => ({
+        channel,
+        x: i * CARD_STEP,
+        index: i
+      }));
+      if (currentFocusedName) {
+        const nextIdx = this._channelData.findIndex(d => d.channel.ChannelName === currentFocusedName);
+        this._index = nextIdx !== -1 ? nextIdx : 0;
+      } else if (this._index >= this._channelData.length) {
+        this._index = 0;
+      }
       this._cardsPool.forEach(card => {
         card._currentDataIdx = -1;
         card.alpha = 0;
         card.x = -9999;
       });
-      this._buildData();
-
-      // Restaurar el índice si el canal sigue existiendo en la fila, de lo contrario volver al inicio
-      if (currentFocusedChannel) {
-        const newIndex = this._channelData.findIndex(d => d.channel.ChannelName === currentFocusedChannel);
-        this._index = newIndex !== -1 ? newIndex : 0;
-      } else {
-        this._index = 0;
-      }
-      this._updateScroll(true); // Posicionamiento inicial instantáneo
+      this._updateScroll(true);
     }
-    _handleVideoError(videoId) {
-      if (!this._failedVideos.has(videoId)) {
-        this._failedVideos.add(videoId);
-        this._buildData();
-      }
+    getFocusedChannel() {
+      if (!this._channelData || this._channelData.length === 0) return null;
+      const entry = this._channelData[this._index];
+      return entry ? entry.channel : null;
     }
-    _buildData() {
-      let currentX = 0;
-      const GAP = 150;
-      const getCardWidth = channel => {
-        const actives = Object.values(channel.Actives || {}).filter(v => !this._failedVideos.has(v.VideoId));
-        const activeCount = actives.length;
-        if (this._isLiveGroup && activeCount > 1) {
-          return 380 + (activeCount - 1) * 355;
-        }
-        return 380;
-      };
-      this._channelData = this._originalChannels.map((channel, i) => {
-        const w = getCardWidth(channel);
-        const info = {
-          channel,
-          x: currentX,
-          w,
-          index: i
-        };
-        currentX += w + GAP;
-        return info;
-      });
-      if (this._channelData.length > 0 && this._index >= this._channelData.length) {
-        this._index = this._channelData.length - 1;
-      }
-
-      // Forzar al pool a actualizar anchos y coordenadas
-      this._cardsPool.forEach(card => {
-        card._currentDataIdx = -1;
-      });
-      this._updateScroll();
+    _focus() {
+      this.tag('Title').text.textColor = COLORS.TEXT_WHITE;
+      this.tag('AccentTick').alpha = 1;
     }
-
-    // --- Control de Foco y Navegación Horizontal ---
+    _unfocus() {
+      this.tag('Title').text.textColor = COLORS.TEXT_GRAY;
+      this.tag('AccentTick').alpha = 0.45;
+    }
     _handleLeft() {
       if (this._index > 0) {
         this._index--;
-        this._updateScroll();
+        this._updateScroll(false);
         this._refocus();
         return true;
       }
@@ -9146,23 +10032,41 @@ var APP_com_domain_app_ZappingStream = (function () {
     _handleRight() {
       if (this._channelData && this._index < this._channelData.length - 1) {
         this._index++;
-        this._updateScroll();
+        this._updateScroll(false);
         this._refocus();
         return true;
       }
       return false;
     }
     _updateScroll() {
+      let instant = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : false;
       if (!this._channelData || this._channelData.length === 0) return;
-      const targetChannel = this._channelData[this._index];
-      if (targetChannel) {
-        let targetX = 60 - targetChannel.x;
+      const totalContentWidth = this._channelData.length * CARD_STEP - SPACING.GAP_LARGE + SPACING.SAFE_X * 2;
+      const visibleTrackWidth = 1920 - SPACING.SAFE_X;
+      let targetX = SPACING.SAFE_X - this._index * CARD_STEP;
+      if (totalContentWidth > 1920) {
+        const minX = visibleTrackWidth - (this._channelData.length * CARD_STEP - SPACING.GAP_LARGE);
+        targetX = Math.max(minX, Math.min(SPACING.SAFE_X, targetX));
+      } else {
+        targetX = SPACING.SAFE_X;
+      }
+      if (instant) {
         this.tag('Slider').x = targetX;
+      } else {
+        this.tag('Slider').patch({
+          smooth: {
+            x: [targetX, {
+              duration: 0.18
+            }]
+          }
+        });
       }
 
-      // Ventana de Virtualización
-      const startIdx = Math.max(0, this._index - 3);
-      const endIdx = Math.min(this._channelData.length - 1, this._index + 7);
+      // Ventana de virtualización basada en la posición real targetX del Slider
+      const leftVisibleCoord = Math.max(0, SPACING.SAFE_X - targetX);
+      const rightVisibleCoord = leftVisibleCoord + (1920 - SPACING.SAFE_X);
+      const startIdx = Math.max(0, Math.floor(leftVisibleCoord / CARD_STEP) - 1);
+      const endIdx = Math.min(this._channelData.length - 1, Math.ceil(rightVisibleCoord / CARD_STEP) + 1);
       this._cardsPool.forEach(card => {
         if (card._currentDataIdx !== -1 && (card._currentDataIdx < startIdx || card._currentDataIdx > endIdx)) {
           card.alpha = 0;
@@ -9177,13 +10081,10 @@ var APP_com_domain_app_ZappingStream = (function () {
         if (card._currentDataIdx !== i) {
           card.patch({
             x: data.x,
-            w: data.w,
             alpha: 1,
             item: {
               channel: data.channel,
-              isExpanded: this._expandedChannels && this._expandedChannels.has(data.channel.ChannelName),
               isLiveGroup: this._isLiveGroup,
-              failedVideos: this._failedVideos,
               ...this._callbacks
             }
           });
@@ -9207,69 +10108,80 @@ var APP_com_domain_app_ZappingStream = (function () {
           w: 1920,
           h: 1080,
           rect: true,
-          color: 0xaa000000
+          color: 0xd908080a
         },
         Container: {
           x: 960,
           y: 540,
           mount: 0.5,
-          w: 1400,
-          h: 600,
+          w: 1180,
+          h: 640,
           rect: true,
           color: COLORS.BG_DARK,
           shader: {
             type: Lightning$1.shaders.RoundedRectangle,
-            radius: BORDER_RADIUS.LARGE
+            radius: BORDER_RADIUS.LARGE,
+            stroke: 2,
+            strokeColor: COLORS.BORDER_LIGHT
           },
-          Border: {
-            w: 1400,
-            h: 600,
+          AccentBar: {
+            x: 48,
+            y: 36,
+            w: 6,
+            h: 34,
             rect: true,
-            color: 0x00000000,
-            strokeObject: {
-              color: COLORS.ACCENT_BLUE,
-              width: 3
-            },
-            shader: {
-              type: Lightning$1.shaders.RoundedRectangle,
-              radius: BORDER_RADIUS.LARGE
-            }
+            color: COLORS.NETFLIX_RED
           },
           Title: {
-            x: 30,
-            y: 30,
+            x: 68,
+            y: 32,
             text: {
-              text: 'Buscar Canal',
-              fontSize: TYPOGRAPHY.FONT_SIZE_LARGE,
+              text: 'Buscar canal',
+              fontSize: 32,
+              fontStyle: 'bold',
               fontFace: TYPOGRAPHY.FONT_FAMILY,
               textColor: COLORS.TEXT_WHITE
             }
           },
           InputBox: {
-            x: 30,
-            y: 80,
-            w: 1340,
-            h: 60,
+            x: 48,
+            y: 92,
+            w: 1084,
+            h: 68,
             rect: true,
-            color: COLORS.ACCENT_BLUE,
+            color: COLORS.BG_BLACK,
             shader: {
               type: Lightning$1.shaders.RoundedRectangle,
-              radius: BORDER_RADIUS.MEDIUM
+              radius: BORDER_RADIUS.MEDIUM,
+              stroke: 2,
+              strokeColor: COLORS.NETFLIX_RED
             },
             InputText: {
-              x: 20,
-              y: 15,
+              x: 24,
+              mountY: 0.5,
+              y: 35,
               text: {
                 text: '',
-                fontSize: TYPOGRAPHY.FONT_SIZE_LARGE,
+                fontSize: 28,
                 fontFace: TYPOGRAPHY.FONT_FAMILY,
-                textColor: COLORS.BG_BLACK
+                textColor: COLORS.TEXT_WHITE
               }
             }
           },
           Keyboard: {
-            x: 30,
-            y: 160
+            x: 48,
+            y: 190
+          },
+          Hint: {
+            x: 590,
+            y: 594,
+            mountX: 0.5,
+            text: {
+              text: 'OK  Escribir / Ejecutar     •     ↩ ATRÁS  Cerrar',
+              fontSize: 17,
+              fontFace: TYPOGRAPHY.FONT_FAMILY,
+              textColor: COLORS.TEXT_MUTED
+            }
           }
         }
       };
@@ -9279,8 +10191,12 @@ var APP_com_domain_app_ZappingStream = (function () {
       this._onSearch = null;
       this._rowIndex = 0;
       this._colIndex = 0;
-      this._keyboardLayout = [['Q', 'W', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P'], ['A', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L'], ['Z', 'X', 'C', 'V', 'B', 'N', 'M', '-', '_'], ['1', '2', '3', '4', '5', '6', '7', '8', '9', '0'], ['ESPACIO', 'BORRAR', 'CANCELAR', 'BUSCAR']];
+      this._prevFlatIndex = -1;
+      this._keyboardLayout = [['Q', 'W', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P'], ['A', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L', 'Ñ'], ['Z', 'X', 'C', 'V', 'B', 'N', 'M', '1', '2', '3'], ['4', '5', '6', '7', '8', '9', '0', '-', '_'], ['ESPACIO', 'BORRAR', 'LIMPIAR', 'BUSCAR', 'CANCELAR']];
       this._keysGrid = [];
+    }
+    _init() {
+      this._buildKeyboard();
     }
     set config(data) {
       this._onSearch = data.onSearch;
@@ -9290,35 +10206,38 @@ var APP_com_domain_app_ZappingStream = (function () {
       this._colIndex = 0;
       this._updateKeyboardFocus();
     }
-    _init() {
-      this._buildKeyboard();
-    }
     _updateDisplay() {
-      this.tag('Container.InputBox.InputText').text.text = this._searchText;
+      const input = this.tag('Container.InputBox.InputText');
+      if (this._searchText) {
+        input.text.text = "".concat(this._searchText, "|");
+        input.text.textColor = COLORS.TEXT_WHITE;
+      } else {
+        input.text.text = 'Escribí el nombre del canal...';
+        input.text.textColor = COLORS.TEXT_MUTED;
+      }
     }
     _buildKeyboard() {
       const keyboard = this.tag('Container.Keyboard');
       const gap = 12;
+      const areaW = 1084;
       let yPos = 0;
       const keysList = [];
       this._keysGrid = [];
-      this._keyboardLayout.forEach((row, rIdx) => {
-        let xPos = 0;
+      this._keyboardLayout.forEach(row => {
         const rowNodes = [];
-
-        // Calcular el ancho de la fila para centrarla
-        let rowWidth = row.reduce((acc, key) => acc + this._getKeyWidth(key) + gap, 0) - gap;
-        xPos = (1340 - rowWidth) / 2; // Centrado horizontal
-
-        row.forEach((key, cIdx) => {
-          let bw = this._getKeyWidth(key);
+        const rowWidth = row.reduce((acc, key) => acc + this._getKeyWidth(key) + gap, 0) - gap;
+        let xPos = Math.round((areaW - rowWidth) / 2);
+        row.forEach(key => {
+          const bw = this._getKeyWidth(key);
+          const isPrimaryAction = key === 'BUSCAR';
           keysList.push({
             x: xPos,
             y: yPos,
             w: bw,
-            h: 60,
+            h: 62,
             rect: true,
-            color: COLORS.BG_PANEL,
+            color: isPrimaryAction ? COLORS.NETFLIX_RED : COLORS.BG_PANEL,
+            _baseColor: isPrimaryAction ? COLORS.NETFLIX_RED : COLORS.BG_PANEL,
             shader: {
               type: Lightning$1.shaders.RoundedRectangle,
               radius: BORDER_RADIUS.MEDIUM
@@ -9326,11 +10245,11 @@ var APP_com_domain_app_ZappingStream = (function () {
             Label: {
               x: bw / 2,
               y: 32,
-              // Centrado vertical manual del texto
               mount: 0.5,
               text: {
                 text: key,
-                fontSize: TYPOGRAPHY.FONT_SIZE_LARGE,
+                fontSize: key.length > 1 ? 20 : 24,
+                fontStyle: 'bold',
                 fontFace: TYPOGRAPHY.FONT_FAMILY,
                 textColor: COLORS.TEXT_WHITE
               }
@@ -9343,66 +10262,64 @@ var APP_com_domain_app_ZappingStream = (function () {
           xPos += bw + gap;
         });
         this._keysGrid.push(rowNodes);
-        yPos += 60 + gap;
+        yPos += 62 + gap;
       });
       keyboard.children = keysList;
     }
     _getKeyWidth(key) {
-      if (key === 'ESPACIO') return 250;
-      if (key === 'BORRAR' || key === 'CANCELAR' || key === 'BUSCAR') return 180;
-      return 65; // Letras estándar
+      if (key === 'ESPACIO') return 210;
+      if (key === 'BUSCAR') return 200;
+      if (key === 'BORRAR' || key === 'LIMPIAR' || key === 'CANCELAR') return 180;
+      return 76;
     }
-    _updateKeyboardFocus() {
-      const keyboard = this.tag('Container.Keyboard');
 
-      // Desenfoquar todos
-      keyboard.children.forEach(btn => {
-        btn.patch({
-          color: COLORS.BG_PANEL,
+    /**
+     * Actualización O(1) de foco: solo modifica la tecla anterior y la nueva (2 patches en vez de 45)
+     */
+    _updateKeyboardFocus() {
+      const children = this.tag('Container.Keyboard').children;
+      if (!children || children.length === 0) return;
+      if (this._prevFlatIndex >= 0 && children[this._prevFlatIndex]) {
+        const prevBtn = children[this._prevFlatIndex];
+        prevBtn.patch({
+          color: prevBtn._baseColor || COLORS.BG_PANEL,
           Label: {
             text: {
               textColor: COLORS.TEXT_WHITE
             }
-          },
-          smooth: {
-            scale: 1.0
           }
         });
-      });
-
-      // Enfocar el actual
+      }
       const flatIndex = this._keysGrid[this._rowIndex][this._colIndex].index;
-      const btn = keyboard.children[flatIndex];
+      const btn = children[flatIndex];
       if (btn) {
         btn.patch({
-          color: COLORS.ACCENT_BLUE,
+          color: COLORS.FOCUS_WHITE,
           Label: {
             text: {
               textColor: COLORS.BG_BLACK
             }
-          },
-          smooth: {
-            scale: 1.1
           }
         });
+        this._prevFlatIndex = flatIndex;
       }
     }
     _handleUp() {
       if (this._rowIndex > 0) {
+        const prevRatio = this._colIndex / Math.max(1, this._keysGrid[this._rowIndex].length - 1);
         this._rowIndex--;
-        if (this._colIndex >= this._keysGrid[this._rowIndex].length) {
-          this._colIndex = this._keysGrid[this._rowIndex].length - 1;
-        }
+        const targetMax = this._keysGrid[this._rowIndex].length - 1;
+        this._colIndex = Math.min(targetMax, Math.round(prevRatio * targetMax));
         this._updateKeyboardFocus();
       }
       return true;
     }
     _handleDown() {
       if (this._rowIndex < this._keysGrid.length - 1) {
+        const prevRatio = this._colIndex / Math.max(1, this._keysGrid[this._rowIndex].length - 1);
         this._rowIndex++;
-        if (this._colIndex >= this._keysGrid[this._rowIndex].length) {
-          this._colIndex = this._keysGrid[this._rowIndex].length - 1;
-        }
+        const targetMax = this._keysGrid[this._rowIndex].length - 1;
+        this._colIndex = Math.min(targetMax, Math.round(prevRatio * targetMax));
         this._updateKeyboardFocus();
       }
       return true;
@@ -9429,6 +10346,11 @@ var APP_com_domain_app_ZappingStream = (function () {
         if (this._searchText.length > 0) {
           this._searchText = this._searchText.slice(0, -1);
         }
+      } else if (key === 'LIMPIAR') {
+        this._searchText = '';
+        if (this._onSearch) this._onSearch('');
+        this.fireAncestors('$closeSearchModal');
+        return true;
       } else if (key === 'CANCELAR') {
         this.fireAncestors('$closeSearchModal');
         return true;
@@ -9442,32 +10364,50 @@ var APP_com_domain_app_ZappingStream = (function () {
       this._updateDisplay();
       return true;
     }
+    _handleKey(e) {
+      if (!e || !e.key) return false;
+      if (e.key === 'Backspace') {
+        this._searchText = this._searchText.slice(0, -1);
+        this._updateDisplay();
+        return true;
+      }
+      if (e.key.length === 1 && /^[a-zA-Z0-9ñÑ _-]$/.test(e.key)) {
+        this._searchText += e.key.toLowerCase();
+        this._updateDisplay();
+        return true;
+      }
+      return false;
+    }
     _handleBack() {
       this.fireAncestors('$closeSearchModal');
       return true;
     }
   }
 
+  const ITEM_H = 58;
+  const POOL_SIZE = 12;
+  const VISIBLE_COUNT = 10;
   class SelectItem extends Lightning$1.Component {
     static _template() {
       return {
-        w: 600,
-        h: 60,
+        w: 680,
+        h: 52,
         rect: true,
-        color: 0x00000000,
+        color: COLORS.TRANSPARENT,
         shader: {
           type: Lightning$1.shaders.RoundedRectangle,
           radius: BORDER_RADIUS.MEDIUM
         },
         Label: {
-          x: 30,
+          x: 24,
           mountY: 0.5,
-          y: 30,
+          y: 27,
           text: {
             text: '',
-            fontSize: TYPOGRAPHY.FONT_SIZE_LARGE,
-            textColor: COLORS.TEXT_WHITE,
-            wordWrapWidth: 540,
+            fontSize: TYPOGRAPHY.FONT_SIZE_NORMAL,
+            fontFace: TYPOGRAPHY.FONT_FAMILY,
+            textColor: COLORS.TEXT_LIGHT,
+            wordWrapWidth: 632,
             maxLines: 1,
             textOverflow: 'ellipsis'
           }
@@ -9476,36 +10416,52 @@ var APP_com_domain_app_ZappingStream = (function () {
     }
     set item(v) {
       this._value = v.value;
-      this.tag('Label').text.text = v.label;
+      this._isCurrent = Boolean(v.isCurrent);
+      this.tag('Label').text.text = this._isCurrent ? "\u2713  ".concat(v.label) : v.label;
+      this._syncVisual();
+    }
+    _syncVisual() {
+      if (this.hasFocus()) {
+        this.patch({
+          color: COLORS.FOCUS_WHITE,
+          Label: {
+            text: {
+              textColor: COLORS.BG_BLACK,
+              fontStyle: 'bold'
+            }
+          }
+        });
+      } else if (this._isCurrent) {
+        this.patch({
+          color: 0xff2c1215,
+          Label: {
+            text: {
+              textColor: COLORS.TEXT_WHITE,
+              fontStyle: 'bold'
+            }
+          }
+        });
+      } else {
+        this.patch({
+          color: COLORS.TRANSPARENT,
+          Label: {
+            text: {
+              textColor: COLORS.TEXT_LIGHT,
+              fontStyle: 'normal'
+            }
+          }
+        });
+      }
     }
     _focus() {
-      this.patch({
-        color: COLORS.ACCENT_BLUE,
-        Label: {
-          text: {
-            textColor: COLORS.BG_BLACK
-          }
-        },
-        smooth: {
-          scale: 1.02
-        }
-      });
+      this._syncVisual();
     }
     _unfocus() {
-      this.patch({
-        color: 0x00000000,
-        Label: {
-          text: {
-            textColor: COLORS.TEXT_WHITE
-          }
-        },
-        smooth: {
-          scale: 1.0
-        }
-      });
+      this._syncVisual();
     }
     _handleEnter() {
       this.fireAncestors('$onOptionSelected', this._value);
+      return true;
     }
   }
   class SelectModal extends Lightning$1.Component {
@@ -9517,38 +10473,72 @@ var APP_com_domain_app_ZappingStream = (function () {
           w: 1920,
           h: 1080,
           rect: true,
-          color: 0xaa000000
+          color: 0xd908080a
         },
         Container: {
           x: 960,
           y: 540,
           mount: 0.5,
-          w: 660,
-          h: 800,
+          w: 760,
+          h: 760,
           rect: true,
           color: COLORS.BG_DARK,
           shader: {
             type: Lightning$1.shaders.RoundedRectangle,
-            radius: BORDER_RADIUS.LARGE
+            radius: BORDER_RADIUS.LARGE,
+            stroke: 2,
+            strokeColor: COLORS.BORDER_LIGHT
+          },
+          AccentLine: {
+            x: 40,
+            y: 34,
+            w: 6,
+            h: 34,
+            rect: true,
+            color: COLORS.NETFLIX_RED
           },
           Title: {
-            x: 30,
+            x: 60,
             y: 30,
             text: {
               text: 'Seleccionar',
-              fontSize: TYPOGRAPHY.FONT_SIZE_XLARGE,
-              textColor: COLORS.ACCENT_BLUE
+              fontSize: 32,
+              fontStyle: 'bold',
+              fontFace: TYPOGRAPHY.FONT_FAMILY,
+              textColor: COLORS.TEXT_WHITE
+            }
+          },
+          Counter: {
+            x: 720,
+            y: 38,
+            mountX: 1,
+            text: {
+              text: '',
+              fontSize: 18,
+              fontFace: TYPOGRAPHY.FONT_FAMILY,
+              textColor: COLORS.TEXT_GRAY
             }
           },
           ListBounds: {
-            x: 30,
-            y: 100,
-            w: 600,
-            h: 660,
+            x: 40,
+            y: 96,
+            w: 680,
+            h: VISIBLE_COUNT * ITEM_H,
             clipping: true,
             Slider: {
               y: 0,
               Items: {}
+            }
+          },
+          FooterHint: {
+            x: 380,
+            y: 714,
+            mountX: 0.5,
+            text: {
+              text: '▲ ▼  Desplazar     •     OK  Confirmar     •     ↩ ATRÁS  Cancelar',
+              fontSize: 17,
+              fontFace: TYPOGRAPHY.FONT_FAMILY,
+              textColor: COLORS.TEXT_MUTED
             }
           }
         }
@@ -9556,32 +10546,52 @@ var APP_com_domain_app_ZappingStream = (function () {
     }
     _construct() {
       this._index = 0;
-      this._options = [];
+      this._optionsData = [];
       this._onSelect = null;
+      this._pool = null;
+    }
+    _init() {
+      const nodes = [];
+      for (let i = 0; i < POOL_SIZE; i++) {
+        nodes.push({
+          type: SelectItem,
+          alpha: 0,
+          y: -9999
+        });
+      }
+      this.tag('Container.ListBounds.Slider.Items').children = nodes;
+      this._pool = this.tag('Container.ListBounds.Slider.Items').children;
     }
     set config(data) {
       this._onSelect = data.onSelect;
-      this.tag('Container.Title').text.text = data.title;
-      this._options = data.options.map((opt, i) => ({
-        type: SelectItem,
-        y: i * 60,
-        item: opt
+      const selectedValue = data.selectedValue !== undefined ? data.selectedValue : null;
+      this.tag('Container.Title').text.text = data.title || 'Seleccionar';
+      this._optionsData = (data.options || []).map(opt => ({
+        ...opt,
+        isCurrent: selectedValue !== null && opt.value === selectedValue
       }));
-      this.tag('Container.ListBounds.Slider.Items').children = this._options;
-      this._index = 0;
+      const activeIdx = this._optionsData.findIndex(o => o.isCurrent);
+      this._index = activeIdx !== -1 ? activeIdx : 0;
+      this._pool.forEach(node => {
+        node._currentDataIdx = -1;
+        node.alpha = 0;
+        node.y = -9999;
+      });
       this._updateScroll(true);
     }
     _handleUp() {
       if (this._index > 0) {
         this._index--;
-        this._updateScroll();
+        this._updateScroll(false);
+        this._refocus();
       }
       return true;
     }
     _handleDown() {
-      if (this._index < this._options.length - 1) {
+      if (this._index < this._optionsData.length - 1) {
         this._index++;
-        this._updateScroll();
+        this._updateScroll(false);
+        this._refocus();
       }
       return true;
     }
@@ -9591,24 +10601,49 @@ var APP_com_domain_app_ZappingStream = (function () {
     }
     _updateScroll() {
       let instant = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : false;
-      let targetY = 0;
-      if (this._index > 5) {
-        // Empieza a scrollear al pasar el 5to item
-        targetY = -(this._index - 5) * 60;
-      }
+      const total = this._optionsData.length;
+      this.tag('Container.Counter').text.text = total > 0 ? "".concat(this._index + 1, " / ").concat(total) : '';
+      if (total === 0) return;
+      const maxScrollIdx = Math.max(0, total - VISIBLE_COUNT);
+      const topIdx = Math.max(0, Math.min(maxScrollIdx, this._index - 4));
+      const targetY = -(topIdx * ITEM_H);
       if (instant) {
         this.tag('Container.ListBounds.Slider').y = targetY;
       } else {
         this.tag('Container.ListBounds.Slider').patch({
           smooth: {
-            y: targetY
+            y: [targetY, {
+              duration: 0.12
+            }]
           }
         });
       }
+      const startIdx = Math.max(0, topIdx - 1);
+      const endIdx = Math.min(total - 1, topIdx + VISIBLE_COUNT);
+      this._pool.forEach(node => {
+        if (node._currentDataIdx !== -1 && (node._currentDataIdx < startIdx || node._currentDataIdx > endIdx)) {
+          node.alpha = 0;
+          node._currentDataIdx = -1;
+          node.y = -9999;
+        }
+      });
+      for (let i = startIdx; i <= endIdx; i++) {
+        const poolIdx = i % POOL_SIZE;
+        const node = this._pool[poolIdx];
+        if (node._currentDataIdx !== i) {
+          node.patch({
+            y: i * ITEM_H,
+            alpha: 1,
+            item: this._optionsData[i]
+          });
+          node._currentDataIdx = i;
+        }
+      }
     }
     _getFocused() {
-      const items = this.tag('Container.ListBounds.Slider.Items').children;
-      return items[this._index] || this;
+      if (!this._optionsData || this._optionsData.length === 0) return this;
+      const poolIdx = this._index % POOL_SIZE;
+      return this._pool[poolIdx] || this;
     }
     $onOptionSelected(value) {
       if (this._onSelect) this._onSelect(value);
@@ -9629,73 +10664,110 @@ var APP_com_domain_app_ZappingStream = (function () {
         Background: {
           w: 1920,
           h: 1080,
-          color: 0xfffbb03b,
-          src: Utils.asset('images/background.png')
+          Base: {
+            w: 1920,
+            h: 1080,
+            rect: true,
+            color: COLORS.BG_CANVAS
+          },
+          Atmosphere: {
+            w: 1920,
+            h: 1080,
+            alpha: 0.22,
+            src: Utils.asset('images/background.png')
+          }
         },
-        // Estructura Principal
         Main: {
           Header: {
             type: AppHeader,
+            x: 0,
             y: 0,
-            zIndex: 10
+            zIndex: 20
           },
           Content: {
-            y: 140,
-            // Debajo del Header
+            x: 0,
+            y: 96,
+            w: 1920,
+            h: 936,
             Status: {
               type: StatusDisplay
             },
             Grid: {
               type: ScheduleGrid,
-              alpha: 0
-            },
-            CardsLive: {
-              type: ChannelCategoryRow,
               alpha: 0,
-              y: 100
+              visible: false
             },
-            CardsDemand: {
-              type: ChannelCategoryRow,
+            CardsSection: {
               alpha: 0,
-              y: 500
+              visible: false,
+              Hero: {
+                type: HeroBanner,
+                x: 0,
+                y: 0
+              },
+              RailsViewport: {
+                x: 0,
+                y: 350,
+                w: 1920,
+                h: 586,
+                clipping: true,
+                RailsSlider: {
+                  x: 0,
+                  y: 0,
+                  CardsLive: {
+                    type: ChannelCategoryRow,
+                    alpha: 0,
+                    visible: false,
+                    y: 8
+                  },
+                  CardsDemand: {
+                    type: ChannelCategoryRow,
+                    alpha: 0,
+                    visible: false,
+                    y: 320
+                  }
+                }
+              }
             }
           },
           Footer: {
             type: AppFooter,
-            y: 980,
-            x: 680,
-            // Centrado horizontal (1920 / 2 - 560 / 2)
-            zIndex: 10
+            x: 0,
+            y: 1032,
+            zIndex: 15
           }
         },
-        // Capas Superpuestas (Modales y Reproductor)
         Overlays: {
           Player: {
             type: TVPlayer,
             alpha: 0,
-            visible: false // Usamos visible para que dispare _inactive() y destruya el Iframe
+            visible: false,
+            zIndex: 40
           },
           Info: {
             type: InfoModal,
-            zIndex: 20
+            alpha: 0,
+            visible: false,
+            zIndex: 30
           },
           Search: {
             type: SearchModal,
             alpha: 0,
-            zIndex: 25
+            visible: false,
+            zIndex: 35
           },
           Select: {
             type: SelectModal,
             alpha: 0,
-            zIndex: 26
+            visible: false,
+            zIndex: 36
           }
         }
       };
     }
     _init() {
-      // --- Estado Principal de la Aplicación ---
       this._channels = [];
-      this._allChannels = []; // Almacenar lista completa para filtrado
+      this._allChannels = [];
       this._provincesList = [];
       this._citiesList = [];
       this._cityProvinceMap = {};
@@ -9703,58 +10775,70 @@ var APP_com_domain_app_ZappingStream = (function () {
       this._searchText = '';
       this._selectedProvince = '';
       this._selectedCity = '';
-      this._viewMode = 'cards'; // 'cards' o 'grid'
+      this._viewMode = 'cards'; // 'cards' | 'grid'
+      this._cameFromChannelJump = false;
+      this._savedSearchBeforeJump = '';
+      this._pendingGridAutoDay = false;
+      this._focusedSection = 'header'; // 'header' | 'content' | 'modal' | 'player' | 'search' | 'select'
+      this._contentRowIndex = 0; // 0 = En Vivo Ahora, 1 = Canales On Demand
+      this._lastBackTs = 0;
 
-      // --- Control de Foco General ---
-      this._focusedSection = 'header'; // 'header', 'content', 'footer', 'modal', 'player', 'search'
-      this._contentRowIndex = 0; // 0 = CardsLive, 1 = CardsDemand (para navegación vertical)
-
-      // --- PUENTE UNIVERSAL (BOTÓN ATRÁS NATIVO) ---
-      // Atrapa el botón atrás físico de la tele sin importar qué rompió el DOM
+      // Puente universal para botón Atrás físico de Smart TVs (con protección contra doble disparo)
       window.addEventListener('appGoBack', () => {
-        const activeModule = this._getFocused(); // Vemos qué componente tiene tu foco (Player, Search, etc)
-        if (activeModule && typeof activeModule._handleBack === 'function') {
-          activeModule._handleBack(); // Forzamos su cierre nativo de Lightning
+        const now = Date.now();
+        if (now - this._lastBackTs < 120) return;
+        this._lastBackTs = now;
+        let node = this._getFocused();
+        while (node) {
+          if (typeof node._handleBack === 'function' && node._handleBack()) {
+            break;
+          }
+          node = node.parent;
         }
       });
-
-      // Configurar Modales
       this.tag('Overlays.Info').onClose = () => {
-        this._focusedSection = this._previousFocus || 'footer';
-        this.tag('Overlays.Info').patch({
-          smooth: {
-            alpha: 0
-          }
-        });
-        this._updateUI();
+        this._focusedSection = this._previousFocus || 'header';
+        this.tag('Overlays.Info').alpha = 0;
+        this.tag('Overlays.Info').visible = false;
         this._refocus();
       };
       this.tag('Overlays.Player').onClose = () => {
         this._focusedSection = 'content';
         this.tag('Overlays.Player').alpha = 0;
         this.tag('Overlays.Player').visible = false;
-        this.tag('Main').alpha = 1; // Restauramos la interfaz principal
+        this.tag('Main').alpha = 1;
         this.tag('Background').alpha = 1;
-        this._updateUI();
         this._refocus();
       };
-
-      // Cargar Datos Iniciales
-      this._fetchChannels();
+      this._fetchChannels(false);
       this._fetchProvinces();
     }
     async _fetchChannels() {
+      let forceRefresh = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : false;
       try {
         this._isLoadingChannels = true;
         this._updateUI();
-        this._channels = await getChannels();
-        this._allChannels = [...this._channels]; // Guardar copia completa para filtrado
+        const freshChannels = await getChannels({
+          forceRefresh
+        });
+        this._allChannels = freshChannels;
+        this._filterChannelsArray();
+        if (this._channels.length > 0 && this._focusedSection === 'header' && !forceRefresh) {
+          this._focusedSection = 'content';
+        }
+        prevalidateAllScheduleChannels(this._allChannels, cleanedAll => {
+          this._allChannels = cleanedAll;
+          this._filterChannelsArray();
+          if (this._viewMode === 'grid' && !this._isLoadingChannels && this._focusedSection !== 'player') {
+            this._updateUI();
+          }
+        });
       } catch (err) {
-        console.error("Error en App al cargar canales:", err);
+        console.error('Error en App al cargar canales:', err);
       } finally {
         this._isLoadingChannels = false;
         this._updateUI();
-        this._refocus(); // Siempre re-enfocar al terminar de cargar, para obligar al render
+        this._refocus();
       }
     }
     async _fetchProvinces() {
@@ -9765,21 +10849,24 @@ var APP_com_domain_app_ZappingStream = (function () {
         this._citiesList = Object.keys(this._cityProvinceMap).sort();
         this._updateUI();
       } catch (err) {
-        console.error("Error cargando provincias", err);
+        console.error('Error cargando provincias:', err);
       }
     }
-
-    // --- Lógica Unificada de Filtros ---
-    _applyFilters() {
+    _filterChannelsArray() {
       let filtered = this._allChannels;
       if (this._searchText.trim() !== '') {
-        filtered = filtered.filter(c => c.ChannelName.toLowerCase().includes(this._searchText.toLowerCase()));
+        const q = this._searchText.toLowerCase();
+        if (this._cameFromChannelJump) {
+          // Al saltar desde un canal específico, filtramos exactamente ese canal
+          const exact = filtered.filter(c => c.ChannelName.toLowerCase() === q);
+          filtered = exact.length > 0 ? exact : filtered.filter(c => c.ChannelName.toLowerCase().indexOf(q) !== -1);
+        } else {
+          filtered = filtered.filter(c => c.ChannelName.toLowerCase().indexOf(q) !== -1);
+        }
       }
       if (this._selectedProvince !== '') {
-        // Si se elige provincia, actualizamos la lista de ciudades permitidas
         this._citiesList = Object.keys(this._cityProvinceMap).filter(c => this._cityProvinceMap[c] === this._selectedProvince).sort();
-        // Si la ciudad elegida ya no pertenece a la provincia, se limpia
-        if (!this._citiesList.includes(this._selectedCity)) {
+        if (this._citiesList.indexOf(this._selectedCity) === -1) {
           this._selectedCity = '';
         }
         filtered = filtered.filter(c => {
@@ -9787,97 +10874,155 @@ var APP_com_domain_app_ZappingStream = (function () {
           return this._cityProvinceMap[c.ChannelCity] === this._selectedProvince;
         });
       } else {
-        // Si borran la provincia, vuelven a estar todas las ciudades disponibles
         this._citiesList = Object.keys(this._cityProvinceMap).sort();
       }
       if (this._selectedCity !== '') {
         filtered = filtered.filter(c => c.ChannelCity === this._selectedCity);
       }
       this._channels = filtered;
+    }
+    _applyFilters() {
+      this._filterChannelsArray();
+      this._contentRowIndex = 0;
       this._updateUI();
     }
+    $onChannelsSanitized() {
+      this._allChannels = purgeDeletedFromChannels(this._allChannels);
+      this._filterChannelsArray();
+    }
+    $onChannelFocused(channel) {
+      if (!channel) return;
+      const provinceName = channel.ChannelCity ? this._cityProvinceMap[channel.ChannelCity] || '' : '';
+      this.tag('Main.Content.CardsSection.Hero').featured = {
+        channel,
+        provinceName
+      };
+    }
+    _openInfoModal() {
+      let channelOrNull = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : null;
+      this._previousFocus = this._focusedSection;
+      this._focusedSection = 'modal';
+      let channelObj = null;
+      if (channelOrNull && typeof channelOrNull === 'object') {
+        channelObj = channelOrNull;
+      } else if (typeof channelOrNull === 'string') {
+        channelObj = this._allChannels.find(c => c.ChannelName === channelOrNull) || null;
+      }
+      const provinceName = channelObj && channelObj.ChannelCity ? this._cityProvinceMap[channelObj.ChannelCity] || '' : '';
+      this.tag('Overlays.Info').visible = true;
+      this.tag('Overlays.Info').alpha = 1;
+      this.tag('Overlays.Info').modalData = channelObj ? {
+        channel: channelObj,
+        provinceName,
+        onPlayChannel: ch => this._playChannel(ch)
+      } : null;
+      this._refocus();
+    }
+    _syncRailsScroll() {
+      let instant = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : false;
+      const liveRow = this.tag('Main.Content.CardsSection.RailsViewport.RailsSlider.CardsLive');
+      const demandRow = this.tag('Main.Content.CardsSection.RailsViewport.RailsSlider.CardsDemand');
+      const slider = this.tag('Main.Content.CardsSection.RailsViewport.RailsSlider');
+      const hasLive = liveRow.visible;
+      const hasDemand = demandRow.visible;
+      let targetY = 0;
+      if (hasLive && hasDemand && this._contentRowIndex === 1) {
+        targetY = -256;
+      }
+      if (instant) {
+        slider.y = targetY;
+      } else {
+        slider.patch({
+          smooth: {
+            y: [targetY, {
+              duration: 0.2
+            }]
+          }
+        });
+      }
+      const activeRow = this._contentRowIndex === 0 && hasLive ? liveRow : hasDemand ? demandRow : hasLive ? liveRow : null;
+      if (activeRow) {
+        const ch = activeRow.getFocusedChannel();
+        if (ch) this.$onChannelFocused(ch);
+      }
+    }
     _updateUI() {
-      // 1. Actualizar el Estado (StatusDisplay)
-      const hasChannels = this._channels.length > 0;
+      const hasAnyLoaded = this._allChannels.length > 0;
+      const hasFiltered = this._channels.length > 0;
+      const hasActiveFilters = Boolean(this._searchText || this._selectedProvince || this._selectedCity);
+      const canalesEnVivo = this._channels.filter(c => c.Actives && Object.keys(c.Actives).length > 0);
+      const canalesOnDemand = this._channels.filter(c => !c.Actives || Object.keys(c.Actives).length === 0);
       this.tag('Main.Content.Status').status = {
         isLoading: this._isLoadingChannels,
-        hasChannels: hasChannels,
-        hasFilteredChannels: true,
-        searchText: this._searchText
+        hasChannels: hasFiltered,
+        hasFilteredChannels: hasFiltered || !hasAnyLoaded,
+        searchText: this._searchText,
+        hasActiveFilters
       };
-
-      // 2. Enviar Canales al componente activo (Grid o Cards)
-      if (hasChannels && !this._isLoadingChannels) {
+      const gridComp = this.tag('Main.Content.Grid');
+      const cardsSection = this.tag('Main.Content.CardsSection');
+      const liveRow = this.tag('Main.Content.CardsSection.RailsViewport.RailsSlider.CardsLive');
+      const demandRow = this.tag('Main.Content.CardsSection.RailsViewport.RailsSlider.CardsDemand');
+      if (hasFiltered && !this._isLoadingChannels) {
+        const sharedCallbacks = {
+          navigateYouTube: url => this._openPlayer(url),
+          toggleInfo: channelRef => this._openInfoModal(channelRef),
+          abrirCanal: channel => this._playChannel(channel),
+          abrirCanalOnStreams: channel => this._playChannel(channel),
+          abrirCanalOnDemand: channel => this._playChannel(channel)
+        };
         if (this._viewMode === 'grid') {
-          this.tag('Main.Content.Grid').alpha = 1;
-          this.tag('Main.Content.CardsLive').alpha = 0;
-          this.tag('Main.Content.CardsDemand').alpha = 0;
-          this.tag('Main.Content.Grid').config = {
+          cardsSection.alpha = 0;
+          cardsSection.visible = false;
+          const autoFocusBestDay = this._pendingGridAutoDay;
+          this._pendingGridAutoDay = false;
+          gridComp.visible = true;
+          gridComp.alpha = 1;
+          gridComp.config = {
             channels: this._channels,
-            navigateYouTube: url => this._openPlayer(url),
-            toggleInfo: channelName => {
-              this._previousFocus = this._focusedSection;
-              this._focusedSection = 'modal';
-              this.tag('Overlays.Info').alpha = 1;
-            },
-            abrirCanal: channel => this._playChannel(channel),
-            abrirCanalOnStreams: channel => this._playChannel(channel),
-            abrirCanalOnDemand: channel => this._playChannel(channel)
+            autoFocusBestDay,
+            ...sharedCallbacks
           };
         } else {
-          this.tag('Main.Content.Grid').alpha = 0;
-
-          // Separar canales en LIVE y ON DEMAND
-          const canalesEnVivo = this._channels.filter(c => c.Actives && Object.keys(c.Actives).length > 0);
-          const canalesOnDemand = this._channels.filter(c => !c.Actives || Object.keys(c.Actives).length === 0);
-
-          // Mostrar u ocultar filas según tengan contenido
-          this.tag('Main.Content.CardsLive').alpha = canalesEnVivo.length > 0 ? 1 : 0;
-          this.tag('Main.Content.CardsDemand').alpha = canalesOnDemand.length > 0 ? 1 : 0;
-
-          // Callbacks comunes
-          const callbacks = {
-            navigateYouTube: url => this._openPlayer(url),
-            toggleInfo: channelName => {
-              this._previousFocus = this._focusedSection;
-              this._focusedSection = 'modal';
-              this.tag('Overlays.Info').alpha = 1;
-            },
-            abrirCanal: channel => this._playChannel(channel),
-            abrirCanalOnStreams: channel => this._playChannel(channel),
-            abrirCanalOnDemand: channel => this._playChannel(channel)
-          };
-
-          // Configurar fila de LIVE
-          if (canalesEnVivo.length > 0) {
-            this.tag('Main.Content.CardsLive').category = {
+          gridComp.alpha = 0;
+          gridComp.visible = false;
+          cardsSection.visible = true;
+          cardsSection.alpha = 1;
+          const showLive = canalesEnVivo.length > 0;
+          const showDemand = canalesOnDemand.length > 0;
+          liveRow.visible = showLive;
+          liveRow.alpha = showLive ? 1 : 0;
+          demandRow.visible = showDemand;
+          demandRow.alpha = showDemand ? 1 : 0;
+          if (showLive) {
+            liveRow.y = 8;
+            liveRow.category = {
               title: 'AHORA',
               channels: canalesEnVivo,
-              expandedChannels: new Set(),
-              // Placeholder
-              ...callbacks
+              ...sharedCallbacks
             };
           }
-
-          // Configurar fila de ON DEMAND
-          if (canalesOnDemand.length > 0) {
-            this.tag('Main.Content.CardsDemand').category = {
+          if (showDemand) {
+            demandRow.y = showLive ? 320 : 8;
+            demandRow.category = {
               title: 'ON DEMAND',
               channels: canalesOnDemand,
-              expandedChannels: new Set(),
-              // Placeholder
-              ...callbacks
+              ...sharedCallbacks
             };
           }
+          if (this._contentRowIndex === 0 && !showLive && showDemand) {
+            this._contentRowIndex = 1;
+          } else if (this._contentRowIndex === 1 && !showDemand && showLive) {
+            this._contentRowIndex = 0;
+          }
+          this._syncRailsScroll(true);
         }
       } else {
-        // Si está cargando o no hay canales, ocultamos las listas
-        this.tag('Main.Content.Grid').alpha = 0;
-        this.tag('Main.Content.CardsLive').alpha = 0;
-        this.tag('Main.Content.CardsDemand').alpha = 0;
+        gridComp.alpha = 0;
+        gridComp.visible = false;
+        cardsSection.alpha = 0;
+        cardsSection.visible = false;
       }
-
-      // 2. Actualizar Cabecera
       this.tag('Main.Header').config = {
         searchText: this._searchText,
         viewMode: this._viewMode,
@@ -9885,16 +11030,25 @@ var APP_com_domain_app_ZappingStream = (function () {
         selectedCity: this._selectedCity,
         provinces: this._provincesList,
         cities: this._citiesList,
+        isRefreshing: this._isLoadingChannels,
         callbacks: {
           onViewModeChange: mode => {
+            if (mode === 'cards' && this._cameFromChannelJump) {
+              this._cameFromChannelJump = false;
+              this._searchText = this._savedSearchBeforeJump || '';
+              this._filterChannelsArray();
+            }
             this._viewMode = mode;
-            this._focusedSection = 'content';
+            if (this._channels.length > 0 && !this._isLoadingChannels) {
+              this._focusedSection = 'content';
+            }
             this._updateUI();
             this._refocus();
           },
           onSearchClick: () => {
             this._previousFocus = this._focusedSection;
             this._focusedSection = 'search';
+            this.tag('Overlays.Search').visible = true;
             this.tag('Overlays.Search').alpha = 1;
             this.tag('Overlays.Search').config = {
               searchText: this._searchText,
@@ -9905,9 +11059,11 @@ var APP_com_domain_app_ZappingStream = (function () {
           onProvinceClick: () => {
             this._previousFocus = this._focusedSection;
             this._focusedSection = 'select';
+            this.tag('Overlays.Select').visible = true;
             this.tag('Overlays.Select').alpha = 1;
             this.tag('Overlays.Select').config = {
-              title: 'Seleccionar Provincia',
+              title: 'Filtrar por Provincia',
+              selectedValue: this._selectedProvince,
               options: [{
                 label: 'Todas las provincias',
                 value: ''
@@ -9927,9 +11083,11 @@ var APP_com_domain_app_ZappingStream = (function () {
             if (!this._citiesList || this._citiesList.length === 0) return;
             this._previousFocus = this._focusedSection;
             this._focusedSection = 'select';
+            this.tag('Overlays.Select').visible = true;
             this.tag('Overlays.Select').alpha = 1;
             this.tag('Overlays.Select').config = {
-              title: 'Seleccionar Ciudad',
+              title: 'Filtrar por Ciudad',
+              selectedValue: this._selectedCity,
               options: [{
                 label: 'Todas las ciudades',
                 value: ''
@@ -9944,254 +11102,142 @@ var APP_com_domain_app_ZappingStream = (function () {
               }
             };
             this._refocus();
-          }
+          },
+          onRefresh: () => this._fetchChannels(true),
+          onShowInfo: () => this._openInfoModal(null)
         }
       };
-
-      // 3. Actualizar Pie de página
       this.tag('Main.Footer').config = {
-        isRefreshing: this._isLoadingChannels,
-        onRefresh: () => this._fetchChannels(),
-        onShowInfo: () => {
-          this._previousFocus = this._focusedSection;
-          this._focusedSection = 'modal';
-          this.tag('Overlays.Info').alpha = 1; // Mostramos el modal
-          this._refocus();
-        }
+        viewMode: this._viewMode,
+        liveCount: canalesEnVivo.length,
+        totalCount: this._channels.length,
+        isRefreshing: this._isLoadingChannels
       };
     }
 
-    // --- Lógica para abrir el canal directamente ---
-    _playChannel(channel) {
-      let videoId = null;
-      let isLive = false;
-
-      // 1. Buscamos en vivo primero...
-      if (channel.Actives && Object.keys(channel.Actives).length > 0) {
-        const activeVideos = Object.values(channel.Actives).sort((a, b) => {
-          if (a.IsPremiere && !b.IsPremiere) return 1;
-          if (!a.IsPremiere && b.IsPremiere) return -1;
-          const timeA = new Date(a.ActualStartTime || a.ScheduledStartTime || a.AddedAt || 0).getTime();
-          const timeB = new Date(b.ActualStartTime || b.ScheduledStartTime || b.AddedAt || 0).getTime();
-          return timeB - timeA;
-        });
-        videoId = activeVideos[0].VideoId;
-        isLive = true;
-      } else if (channel.ChannelLiveUrl) {
-        const match = channel.ChannelLiveUrl.match(/v=([^&]+)/);
-        if (match && match[1]) {
-          videoId = match[1];
-        }
+    /**
+     * Navega internamente a la pestaña de Transmisiones filtrando por el canal elegido
+     * y posicionándose automáticamente en el día más reciente con contenido.
+     */
+    _openChannelTransmissions(channel) {
+      if (!channel || !channel.ChannelName) return;
+      if (!this._cameFromChannelJump) {
+        this._savedSearchBeforeJump = this._searchText;
+        this._savedRowBeforeJump = this._contentRowIndex;
       }
-
-      // 2. Tomamos la decisión
-      if (isLive && videoId) {
-        // EN VIVO: Reproductor interno
-        this._openPlayer("https://www.youtube.com/watch?v=".concat(videoId));
-      } else {
-        // ON DEMAND / OFFLINE: Vamos a la app nativa
-        let targetUrl = '';
-        if (videoId) {
-          // Si por algún motivo tenía un video específico guardado
-          targetUrl = "https://www.youtube.com/watch?v=".concat(videoId);
-        } else {
-          // ACÁ ESTÁ LA MAGIA: Intentamos extraer el ID del canal ("UC...")
-          // Asumimos que tenés el ID guardado en tu objeto channel, o lo extraemos de la URL
-          let channelId = channel.ChannelId || null;
-          if (!channelId && channel.ChannelLiveUrl) {
-            const idMatch = channel.ChannelLiveUrl.match(/channel\/(UC[\w-]+)/);
-            if (idMatch && idMatch[1]) channelId = idMatch[1];
-          }
-          if (channelId && channelId.startsWith('UC')) {
-            // Cambiamos "UC" por "UU" para crear el ID de la Playlist de uploads
-            const playlistId = 'UU' + channelId.substring(2);
-
-            // Tizen necesita un ID de video real en 'v=' para no fallar el deep link.
-            // Buscamos un video reciente del canal (Past o Upcoming) para usarlo como punto de entrada.
-            let firstVid = null;
-            if (channel.Past && Object.keys(channel.Past).length > 0) {
-              const pastVideos = Object.values(channel.Past);
-              if (pastVideos.length > 0) firstVid = pastVideos[0].VideoId;
-            }
-            if (!firstVid && channel.Upcoming && Object.keys(channel.Upcoming).length > 0) {
-              const upcomingVideos = Object.values(channel.Upcoming);
-              if (upcomingVideos.length > 0) firstVid = upcomingVideos[0].VideoId;
-            }
-            if (firstVid) {
-              // Pasamos un video real + la playlist para que Tizen lo abra sin quejarse
-              targetUrl = "https://www.youtube.com/watch?v=".concat(firstVid, "&list=").concat(playlistId);
-            } else {
-              // Fallback si no hay videos guardados
-              targetUrl = "https://www.youtube.com/playlist?list=".concat(playlistId);
-            }
-          } else {
-            // Si no tenemos el ID "UC...", mandamos la URL original y que la tele decida si la soporta
-            targetUrl = channel.ChannelLiveUrl || '';
-          }
-        }
-
-        // Mandamos a abrir nativamente
-        if (targetUrl) {
-          this._openPlayer(targetUrl, true);
-        }
-      }
+      this._cameFromChannelJump = true;
+      this._searchText = channel.ChannelName;
+      this._viewMode = 'grid';
+      this._pendingGridAutoDay = true;
+      this._focusedSection = 'content';
+      this._filterChannelsArray();
+      this._updateUI();
+      this._refocus();
     }
 
-    // --- Abrir Reproductor ---
-    _openPlayer(url) {
-      let forceNative = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : false;
-      if (forceNative) {
-        this._launchNativeYouTube(url);
+    /**
+     * Reproduce en el reproductor interno si está en vivo; de lo contrario lleva
+     * a la pestaña de Transmisiones filtrada por ese canal (nunca sale de la app).
+     */
+    _playChannel(channel) {
+      if (!channel) return;
+      const activeVideos = channel.ActiveList || Object.values(channel.Actives || {});
+      if (activeVideos.length > 0 && activeVideos[0].VideoId) {
+        this._openPlayer("https://www.youtube.com/watch?v=".concat(activeVideos[0].VideoId));
         return;
       }
+      this._openChannelTransmissions(channel);
+    }
+    _openPlayer(url) {
+      if (!url) return;
       const match = url.match(/v=([^&]+)/);
       if (match && match[1]) {
         this._focusedSection = 'player';
         this.tag('Overlays.Player').videoId = match[1];
         this.tag('Overlays.Player').alpha = 1;
         this.tag('Overlays.Player').visible = true;
-        this.tag('Main').alpha = 0; // Ocultamos la app detrás del reproductor
+        this.tag('Main').alpha = 0;
         this.tag('Background').alpha = 0;
         this._refocus();
-      } else {
-        // En lugar de window.open, forzamos abrir la app nativa mediante Deep Links
-        this._launchNativeYouTube(url);
       }
     }
-
-    // --- Helper para lanzar la app NATIVA de YouTube según el Sistema Operativo ---
-    _launchNativeYouTube(url) {
-      // Detectamos si es una playlist
-      const listMatch = url.match(/[?&]list=([^&]+)/);
-      const playlistId = listMatch ? listMatch[1] : null;
-      const isPlaylist = url.includes('/playlist?') || listMatch && !url.match(/v=[^&]+/);
-
-      // 1. Tizen (Samsung Smart TV)
-      if (typeof tizen !== 'undefined' && tizen.application) {
-        try {
-          const appControl = new tizen.ApplicationControl('http://tizen.org/appcontrol/operation/view', url);
-          tizen.application.launchAppControl(appControl, '111299001912', () => console.log('YouTube nativo lanzado en Tizen'), e => {
-            console.error('Fallo al abrir YouTube en Tizen:', e.message);
-            // 🚫 NUNCA hacer window.open acá. Tu app moriría.
-          });
-          return;
-        } catch (err) {}
-      }
-
-      // 2. WebOS (LG Smart TV)
-      if (window.webOS && window.webOS.service) {
-        // Para WebOS, las playlists a veces requieren contentId en lugar de contentTarget
-        const params = isPlaylist && playlistId ? {
-          contentId: "list=".concat(playlistId)
-        } : {
-          contentTarget: url
-        };
-        window.webOS.service.request('luna://com.webos.applicationManager', {
-          method: 'launch',
-          parameters: {
-            id: 'youtube.leanback.v4',
-            // ID oficial de YouTube en WebOS
-            params: params
-          },
-          onFailure: e => {
-            console.error('Fallo al abrir YouTube en WebOS:', e);
-            window.open(url, '_blank');
-          }
-        });
-        return;
-      }
-
-      // 3. Android TV (Capacitor) / Genérico
-      if (window.Capacitor && window.Capacitor.isNativePlatform()) {
-        // En Android, el intent URI fuerza al SO a salir del WebView y buscar la app configurada (YouTube)
-        const cleanUrl = url.replace(/^https?:\/\//, '');
-        const intentUrl = "intent://".concat(cleanUrl, "#Intent;scheme=https;action=android.intent.action.VIEW;end;");
-        window.location.href = intentUrl;
-        return;
-      }
-
-      // 4. Fallback genérico a navegador
-      window.open(url, '_blank');
-    }
-
-    // --- Búsqueda de Canales ---
     _performSearch(text) {
+      this._cameFromChannelJump = false;
+      this._savedSearchBeforeJump = '';
       this._searchText = text.toLowerCase();
       this._applyFilters();
-      this._focusedSection = 'content';
+      this._focusedSection = this._channels.length > 0 ? 'content' : 'header';
       this._refocus();
     }
-
-    // --- Manejador para seleccionar Stream de un Canal con múltiples activos ---
     $onSelectStream(data) {
       const channel = data.channel,
         activeVideos = data.activeVideos;
       this._previousFocus = this._focusedSection;
       this._focusedSection = 'select';
+      this.tag('Overlays.Select').visible = true;
       this.tag('Overlays.Select').alpha = 1;
       this.tag('Overlays.Select').config = {
-        title: 'Transmisiones en curso',
+        title: "".concat(channel.ChannelName, " \u2014 En vivo"),
         options: activeVideos.map(v => ({
-          label: (v.IsPremiere ? '⭐ ' : '🔴 ') + (v.Title || channel.ChannelName),
+          label: (v.IsPremiere ? '★ ' : '● ') + (v.Title || channel.ChannelName),
           value: v.VideoId
         })),
         onSelect: videoId => {
           this.tag('Overlays.Select').alpha = 0;
+          this.tag('Overlays.Select').visible = false;
           this._openPlayer("https://www.youtube.com/watch?v=".concat(videoId));
         }
       };
       this._refocus();
     }
-
-    // --- Manejador para cerrar modal de búsqueda ---
     $closeSearchModal() {
       this.tag('Overlays.Search').alpha = 0;
-      this._focusedSection = this._previousFocus || 'header';
+      this.tag('Overlays.Search').visible = false;
+      this._focusedSection = this._previousFocus === 'content' && this._channels.length > 0 ? 'content' : 'header';
       this._updateUI();
       this._refocus();
     }
-
-    // --- Manejador para cerrar modal de selector ---
     $closeSelectModal() {
       this.tag('Overlays.Select').alpha = 0;
-      this._focusedSection = this._previousFocus || 'header';
+      this.tag('Overlays.Select').visible = false;
+      this._focusedSection = this._previousFocus === 'content' && this._channels.length > 0 ? 'content' : 'header';
       this._updateUI();
       this._refocus();
     }
-
-    // --- Manejo del Foco General ---
     _handleUp() {
-      if (this._focusedSection === 'footer') {
-        this._focusedSection = 'content';
-        this._refocus();
-      } else if (this._focusedSection === 'content') {
-        // Si estamos en CardsDemand, intentamos ir a CardsLive
-        if (this._contentRowIndex === 1 && this.tag('Main.Content.CardsLive').alpha === 1) {
+      if (this._focusedSection === 'content') {
+        const liveRow = this.tag('Main.Content.CardsSection.RailsViewport.RailsSlider.CardsLive');
+        if (this._viewMode === 'cards' && this._contentRowIndex === 1 && liveRow.visible) {
           this._contentRowIndex = 0;
+          this._syncRailsScroll(false);
           this._refocus();
           return true;
         }
-        // Si no podemos subir en content, vamos al header
         this._focusedSection = 'header';
         this._refocus();
-      } else if (this._focusedSection === 'header') ;
+        return true;
+      }
+      return true;
     }
     _handleDown() {
       if (this._focusedSection === 'header') {
-        this._focusedSection = 'content';
-        this._contentRowIndex = 0; // Empezar en la primera fila visible
-        this._refocus();
-      } else if (this._focusedSection === 'content') {
-        // Si estamos en CardsLive, intentamos ir a CardsDemand
-        if (this._contentRowIndex === 0 && this.tag('Main.Content.CardsDemand').alpha === 1) {
+        if (this._channels.length > 0 && !this._isLoadingChannels) {
+          this._focusedSection = 'content';
+          this._refocus();
+        }
+        return true;
+      }
+      if (this._focusedSection === 'content' && this._viewMode === 'cards') {
+        const demandRow = this.tag('Main.Content.CardsSection.RailsViewport.RailsSlider.CardsDemand');
+        if (this._contentRowIndex === 0 && demandRow.visible) {
           this._contentRowIndex = 1;
+          this._syncRailsScroll(false);
           this._refocus();
           return true;
         }
-        // Si no podemos bajar en content, vamos al footer
-        this._focusedSection = 'footer';
-        this._refocus();
-      } else if (this._focusedSection === 'footer') ;
+        return true;
+      }
+      return true;
     }
     _getFocused() {
       if (this._focusedSection === 'search') return this.tag('Overlays.Search');
@@ -10199,35 +11245,46 @@ var APP_com_domain_app_ZappingStream = (function () {
       if (this._focusedSection === 'modal') return this.tag('Overlays.Info');
       if (this._focusedSection === 'player') return this.tag('Overlays.Player');
       if (this._focusedSection === 'header') return this.tag('Main.Header');
-      if (this._focusedSection === 'footer') return this.tag('Main.Footer');
       if (this._focusedSection === 'content') {
-        if (this._viewMode === 'grid' && this.tag('Main.Content.Grid').alpha === 1) {
-          return this.tag('Main.Content.Grid');
-        } else if (this._viewMode === 'cards') {
-          // Navegar entre CardsLive y CardsDemand
-          if (this._contentRowIndex === 0 && this.tag('Main.Content.CardsLive').alpha === 1) {
-            return this.tag('Main.Content.CardsLive');
-          } else if (this._contentRowIndex === 1 && this.tag('Main.Content.CardsDemand').alpha === 1) {
-            return this.tag('Main.Content.CardsDemand');
-          }
-          // Si no está visible, buscar la primera fila visible
-          if (this.tag('Main.Content.CardsLive').alpha === 1) {
+        const gridComp = this.tag('Main.Content.Grid');
+        const liveRow = this.tag('Main.Content.CardsSection.RailsViewport.RailsSlider.CardsLive');
+        const demandRow = this.tag('Main.Content.CardsSection.RailsViewport.RailsSlider.CardsDemand');
+        if (this._viewMode === 'grid' && gridComp.visible) {
+          return gridComp;
+        }
+        if (this._viewMode === 'cards') {
+          if (this._contentRowIndex === 0 && liveRow.visible) return liveRow;
+          if (this._contentRowIndex === 1 && demandRow.visible) return demandRow;
+          if (liveRow.visible) {
             this._contentRowIndex = 0;
-            return this.tag('Main.Content.CardsLive');
+            return liveRow;
           }
-          if (this.tag('Main.Content.CardsDemand').alpha === 1) {
+          if (demandRow.visible) {
             this._contentRowIndex = 1;
-            return this.tag('Main.Content.CardsDemand');
+            return demandRow;
           }
         }
       }
-      return this;
+      return this.tag('Main.Header');
     }
-
-    // --- ESCUDO FINAL ---
-    // Si un evento "Atrás" llega hasta la raíz de la app sin ser manejado,
-    // lo absorbemos devolviendo true para evitar que intente cerrar la app o abrir modales.
     _handleBack() {
+      // Si entramos a Transmisiones desde un canal On Demand, Atrás nos devuelve directo a Inicio en esa fila
+      if (this._cameFromChannelJump && this._viewMode === 'grid') {
+        this._cameFromChannelJump = false;
+        this._searchText = this._savedSearchBeforeJump || '';
+        this._viewMode = 'cards';
+        this._contentRowIndex = typeof this._savedRowBeforeJump === 'number' ? this._savedRowBeforeJump : 1;
+        this._focusedSection = 'content';
+        this._filterChannelsArray();
+        this._updateUI();
+        this._refocus();
+        return true;
+      }
+      if (this._focusedSection === 'content') {
+        this._focusedSection = 'header';
+        this._refocus();
+        return true;
+      }
       return true;
     }
   }
