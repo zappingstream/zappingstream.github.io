@@ -123,7 +123,7 @@ var getAppMetadata = function getAppMetadata() {
 
   _newArrowCheck(this, _this);
 
-  return fetchJson('./metadata.json?v=0d0a83c802').then(function (metadata) {
+  return fetchJson('./metadata.json?v=b404a0f2c7').then(function (metadata) {
     _newArrowCheck(this, _this7);
 
     metadata.safeId = "APP_".concat(metadata.identifier.replace(/[^0-9a-zA-Z_$]/g, '_'));
@@ -142,7 +142,7 @@ var getSettings = function getSettings() {
     _newArrowCheck(this, _this8);
 
     var settings;
-    fetchJson('./settings.json?v=0d0a83c802').then(function (json) {
+    fetchJson('./settings.json?v=b404a0f2c7').then(function (json) {
       _newArrowCheck(this, _this9);
 
       return settings = json;
@@ -228,7 +228,7 @@ var loadLightning = function loadLightning(esEnv) {
 var loadAppBundle = function loadAppBundle(esEnv) {
   _newArrowCheck(this, _this);
 
-  var filename = !esEnv || esEnv === 'es6' ? './appBundle.0d0a83c802.js?v=0d0a83c802' : './appBundle.' + esEnv + '.js';
+  var filename = !esEnv || esEnv === 'es6' ? './appBundle.b404a0f2c7.js?v=b404a0f2c7' : './appBundle.' + esEnv + '.js';
   return loadJS(filename, 'appbundle');
 }.bind(undefined);
 

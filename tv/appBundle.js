@@ -3,7 +3,7 @@
  * SDK version: 5.5.7
  * CLI version: 2.14.2
  * 
- * Generated: Fri, 27 Nov 2026 12:11:15 GMT
+ * Generated: Fri, 27 Nov 2026 13:09:54 GMT
  */
 
 var APP_com_domain_app_ZappingStream = (function () {
@@ -8285,6 +8285,7 @@ var APP_com_domain_app_ZappingStream = (function () {
         h: 1080,
         rect: true,
         color: COLORS.TRANSPARENT,
+        // Popup superior izquierdo: controles de reproducción y CC
         Controls: {
           x: 64,
           y: 48,
@@ -8335,6 +8336,37 @@ var APP_com_domain_app_ZappingStream = (function () {
               }
             }
           }
+        },
+        // Popup superior derecho: estado de la transmisión (En vivo / Estreno / Emitido...)
+        StatusPopup: {
+          mountX: 1,
+          x: 1856,
+          y: 48,
+          alpha: 1,
+          w: 240,
+          h: 60,
+          rect: true,
+          color: 0xe8101014,
+          Label: {
+            mount: 0.5,
+            x: 117,
+            y: 31,
+            text: {
+              text: '● En vivo',
+              fontSize: 21,
+              fontStyle: 'bold',
+              fontFace: TYPOGRAPHY.FONT_FAMILY,
+              textColor: COLORS.TEXT_WHITE
+            }
+          },
+          RightAccent: {
+            x: 234,
+            y: 0,
+            w: 6,
+            h: 60,
+            rect: true,
+            color: COLORS.NETFLIX_RED
+          }
         }
       };
     }
@@ -8345,6 +8377,7 @@ var APP_com_domain_app_ZappingStream = (function () {
       this._isPlaying = true;
       this._ccEnabled = false;
       this._loadedWithCcPolicy = false;
+      this._hasStatusMeta = false;
     }
     _active() {
       this._isClosing = false;
@@ -8358,6 +8391,9 @@ var APP_com_domain_app_ZappingStream = (function () {
       this._clearTimer();
       this._clearFocusLock();
     }
+    set playbackMeta(meta) {
+      this._updateStatusPopup(meta);
+    }
     set videoId(id) {
       this._videoId = id;
       if (this.active) {
@@ -8367,6 +8403,72 @@ var APP_com_domain_app_ZappingStream = (function () {
     }
     set onClose(callback) {
       this._onCloseCallback = callback;
+    }
+    _updateStatusPopup(meta) {
+      if (!meta) {
+        this._hasStatusMeta = false;
+        this.tag('StatusPopup').alpha = 0;
+        return;
+      }
+      this._hasStatusMeta = true;
+      const isLive = Boolean(meta.isLive);
+      const isPremiere = Boolean(meta.isPremiere);
+      const isPast = Boolean(meta.isPast);
+      const refDateStr = meta.referenceDate || '';
+      let labelText = '';
+      let accentColor = COLORS.NETFLIX_RED;
+      const today = new Date();
+      const parsedDate = refDateStr ? new Date(refDateStr) : null;
+      const hasValidDate = Boolean(parsedDate && !isNaN(parsedDate.getTime()));
+      const formatShortDate = d => d.toLocaleDateString('es-AR', {
+        day: '2-digit',
+        month: '2-digit',
+        year: 'numeric'
+      });
+      if (isLive) {
+        if (isPremiere) {
+          labelText = '★ Estreno';
+          accentColor = COLORS.PREMIERE_BADGE;
+        } else {
+          labelText = '● En vivo';
+          accentColor = COLORS.NETFLIX_RED;
+        }
+      } else if (isPast || hasValidDate && parsedDate.getTime() <= Date.now()) {
+        accentColor = isPremiere ? COLORS.PREMIERE_BADGE : COLORS.BORDER_LIGHT;
+        if (hasValidDate && isSameLocalDay(parsedDate, today)) {
+          labelText = isPremiere ? 'Estrenado hoy' : 'Emitido hoy';
+        } else if (hasValidDate) {
+          const formatted = formatShortDate(parsedDate);
+          labelText = isPremiere ? "Estrenado el ".concat(formatted) : "Emitido el ".concat(formatted);
+        } else {
+          labelText = isPremiere ? 'Estrenado' : 'Emitido';
+        }
+      } else {
+        // Transmisión futura programada
+        accentColor = isPremiere ? COLORS.PREMIERE_BADGE : COLORS.ACCENT_BLUE;
+        if (hasValidDate && isSameLocalDay(parsedDate, today)) {
+          labelText = isPremiere ? 'Estreno programado hoy' : 'Programado hoy';
+        } else if (hasValidDate) {
+          const formatted = formatShortDate(parsedDate);
+          labelText = isPremiere ? "Estreno el ".concat(formatted) : "Programado el ".concat(formatted);
+        } else {
+          labelText = isPremiere ? 'Estreno programado' : 'Programado';
+        }
+      }
+      const boxW = Math.max(190, Math.round(labelText.length * 12.2) + 56);
+      this.tag('StatusPopup').patch({
+        w: boxW,
+        Label: {
+          x: Math.round((boxW - 6) / 2),
+          text: {
+            text: labelText
+          }
+        },
+        RightAccent: {
+          x: boxW - 6,
+          color: accentColor
+        }
+      });
     }
     _sendPlayerCommand(func) {
       let args = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : [];
@@ -8378,11 +8480,6 @@ var APP_com_domain_app_ZappingStream = (function () {
         }), '*');
       }
     }
-
-    /**
-     * Fuerza el encendido o apagado real de los módulos de subtítulos (captions y cc en vivo)
-     * dentro del reproductor HTML5 embebido de YouTube.
-     */
     _applyCaptionsState() {
       if (!this._iframe || !this._iframe.contentWindow) return;
       if (this._ccEnabled) {
@@ -8416,7 +8513,6 @@ var APP_com_domain_app_ZappingStream = (function () {
           } else if (data.event === 'infoDelivery' && data.info) {
             if (data.info.currentTime !== undefined) this._currentTime = data.info.currentTime;
             if (data.info.duration !== undefined) this._duration = data.info.duration;
-            // Al iniciar la reproducción (playerState === 1), forzamos el estado de CC elegido
             if (data.info.playerState === 1 && !this._appliedInitialCc) {
               this._appliedInitialCc = true;
               this._applyCaptionsState();
@@ -8481,9 +8577,13 @@ var APP_com_domain_app_ZappingStream = (function () {
     }
     _wakeUpControls() {
       this.tag('Controls').alpha = 1;
+      if (this._hasStatusMeta) {
+        this.tag('StatusPopup').alpha = 1;
+      }
       this._clearTimer();
       this._timer = setTimeout(() => {
         this.tag('Controls').alpha = 0;
+        this.tag('StatusPopup').alpha = 0;
         this._timer = null;
       }, 4000);
     }
@@ -8515,13 +8615,9 @@ var APP_com_domain_app_ZappingStream = (function () {
       this._updateControlsText();
       this._wakeUpControls();
       if (!this._ccEnabled) {
-        // Apagado instantáneo sin recargar el video
         this._applyCaptionsState();
         return;
       }
-
-      // Al encender CC: si el iframe se creó inicialmente con cc_load_policy=0,
-      // recargamos con cc_load_policy=1 conservando el segundo actual para cargar pistas automáticas (ASR)
       if (!this._loadedWithCcPolicy) {
         const resumeAt = this._duration > 0 && this._currentTime > 2 ? this._currentTime : 0;
         this._destroyIframe();
@@ -9064,7 +9160,7 @@ var APP_com_domain_app_ZappingStream = (function () {
     }
     _handleEnter() {
       if (this._item && this._item.navigateYouTube && this._item.ev) {
-        this._item.navigateYouTube("https://www.youtube.com/watch?v=".concat(this._item.ev.VideoId));
+        this._item.navigateYouTube("https://www.youtube.com/watch?v=".concat(this._item.ev.VideoId), this._item.ev);
       }
       return true;
     }
@@ -11027,7 +11123,7 @@ var APP_com_domain_app_ZappingStream = (function () {
       const demandRow = this.tag('Main.Content.CardsSection.RailsViewport.RailsSlider.CardsDemand');
       if (hasFiltered && !this._isLoadingChannels) {
         const sharedCallbacks = {
-          navigateYouTube: url => this._openPlayer(url),
+          navigateYouTube: (url, videoMeta) => this._openPlayer(url, videoMeta),
           toggleInfo: channelRef => this._openInfoModal(channelRef),
           abrirCanal: channel => this._playChannel(channel),
           abrirCanalOnStreams: channel => this._playChannel(channel),
@@ -11205,17 +11301,67 @@ var APP_com_domain_app_ZappingStream = (function () {
       if (!channel) return;
       const activeVideos = channel.ActiveList || Object.values(channel.Actives || {});
       if (activeVideos.length > 0 && activeVideos[0].VideoId) {
-        this._openPlayer("https://www.youtube.com/watch?v=".concat(activeVideos[0].VideoId));
+        const mainVid = activeVideos[0];
+        this._openPlayer("https://www.youtube.com/watch?v=".concat(mainVid.VideoId), {
+          ...mainVid,
+          Live: mainVid.Live !== false
+        });
         return;
       }
       this._openChannelTransmissions(channel);
     }
+    _resolvePlaybackMeta(videoId) {
+      let rawMeta = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : null;
+      let source = rawMeta;
+      let bucketType = null;
+      if (!source && videoId && this._allChannels) {
+        for (let i = 0; i < this._allChannels.length; i++) {
+          const ch = this._allChannels[i];
+          if (ch.Actives && ch.Actives[videoId]) {
+            source = ch.Actives[videoId];
+            bucketType = 'active';
+            break;
+          }
+          if (ch.Past && ch.Past[videoId]) {
+            source = ch.Past[videoId];
+            bucketType = 'past';
+            break;
+          }
+          if (ch.Upcoming && ch.Upcoming[videoId]) {
+            source = ch.Upcoming[videoId];
+            bucketType = 'upcoming';
+            break;
+          }
+        }
+      }
+      if (!source) {
+        return {
+          isLive: true,
+          isPremiere: false,
+          isPast: false,
+          referenceDate: ''
+        };
+      }
+      const isLive = Boolean(bucketType === 'active' || source.Live);
+      const isPremiere = Boolean(source.IsPremiere || source.WasPremiere);
+      const isPast = Boolean(!isLive && (bucketType === 'past' || source.IsPast || source.ActualEndTime || source.EndedAt));
+      const referenceDate = isPast ? source.ActualEndTime || source.EndedAt || source.ActualStartTime || source.EffectiveStartTime || source.ScheduledStartTime || '' : source.ActualStartTime || source.ScheduledStartTime || source.EffectiveStartTime || source.AddedAt || '';
+      return {
+        isLive,
+        isPremiere,
+        isPast,
+        referenceDate
+      };
+    }
     _openPlayer(url) {
+      let videoMeta = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : null;
       if (!url) return;
       const match = url.match(/v=([^&]+)/);
       if (match && match[1]) {
+        const videoId = match[1];
         this._focusedSection = 'player';
-        this.tag('Overlays.Player').videoId = match[1];
+        this.tag('Overlays.Player').playbackMeta = this._resolvePlaybackMeta(videoId, videoMeta);
+        this.tag('Overlays.Player').videoId = videoId;
         this.tag('Overlays.Player').alpha = 1;
         this.tag('Overlays.Player').visible = true;
         this.tag('Main').alpha = 0;
@@ -11245,9 +11391,13 @@ var APP_com_domain_app_ZappingStream = (function () {
           value: v.VideoId
         })),
         onSelect: videoId => {
+          const chosen = activeVideos.find(v => v.VideoId === videoId) || null;
           this.tag('Overlays.Select').alpha = 0;
           this.tag('Overlays.Select').visible = false;
-          this._openPlayer("https://www.youtube.com/watch?v=".concat(videoId));
+          this._openPlayer("https://www.youtube.com/watch?v=".concat(videoId), chosen ? {
+            ...chosen,
+            Live: chosen.Live !== false
+          } : null);
         }
       };
       this._refocus();
