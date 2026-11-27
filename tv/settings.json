@@ -5,7 +5,7 @@
       "h": 1080,
       "clearColor": "0x00000000",
       "useImageWorker": true,
-      "boundsMargin": [120, 120, 120, 120]
+      "boundsMargin": [60, 60, 60, 60]
     },
     "debug": false
   },

@@ -3,7 +3,7 @@
  * SDK version: 5.5.7
  * CLI version: 2.14.2
  * 
- * Generated: Thu, 26 Nov 2026 22:48:34 GMT
+ * Generated: Fri, 27 Nov 2026 12:11:15 GMT
  */
 
 var APP_com_domain_app_ZappingStream = (function () {
@@ -6679,16 +6679,29 @@ var APP_com_domain_app_ZappingStream = (function () {
     const separator = url.indexOf('?') !== -1 ? '&' : '?';
     return "".concat(url).concat(separator, "t=").concat(parsed);
   };
+  const formatBannerUrl = bannerUrl => {
+    if (!bannerUrl) return '';
+    const base = bannerUrl.split('=')[0];
+    return "".concat(base, "=w1060-fcrop64=1,00005a57ffffa5a8-k-c0xffffffff-no-nd-rj");
+  };
+
+  /**
+   * Optimiza imágenes para Smart TV:
+   * - Reduce resolución al tamaño real de cada componente (ahorro masivo de VRAM)
+   * - Usa JPEG comprimido (decodificación mucho más liviana en CPUs de TV que WebP)
+   * - Fuerza cabeceras CORS válidas mediante wsrv.nl para no romper texturas WebGL
+   */
   const getOptimizedImageUrl = function (url) {
-    let width = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : 400;
+    let width = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : 320;
     let dateString = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : '';
+    let quality = arguments.length > 3 && arguments[3] !== undefined ? arguments[3] : 68;
     if (!url) return '';
     let src = url.replace(/(maxresdefault|hqdefault|sddefault)\.jpg/i, 'mqdefault.jpg');
     if (dateString) {
       src = getFreshImage(src, dateString);
     }
     if (src.indexOf('ytimg.com') !== -1 || src.indexOf('youtube.com') !== -1 || src.indexOf('ggpht.com') !== -1 || src.indexOf('googleusercontent.com') !== -1) {
-      return "https://wsrv.nl/?url=".concat(encodeURIComponent(src), "&w=").concat(width, "&output=webp");
+      return "https://wsrv.nl/?url=".concat(encodeURIComponent(src), "&w=").concat(width, "&q=").concat(quality, "&output=jpg");
     }
     return src;
   };
@@ -6708,8 +6721,6 @@ var APP_com_domain_app_ZappingStream = (function () {
   };
 
   const API_URL$1 = 'https://zappingstream-api.vercel.app/channels';
-
-  // Caché en memoria durante la sesión para no volver a consultar videos ya verificados
   const verifiedVideoIds = new Set();
   const deletedVideoIds = new Set();
   const validatedDayKeys = new Set();
@@ -6769,19 +6780,27 @@ var APP_com_domain_app_ZappingStream = (function () {
     }
     return clean;
   };
-  const findFallbackVideoId = channel => {
-    const extractFirst = collection => {
-      if (!collection || typeof collection !== 'object') return null;
+  const findLatestPreviewThumb = channel => {
+    const pickFrom = collection => {
+      if (!collection || typeof collection !== 'object') return '';
       const list = Array.isArray(collection) ? collection : Object.values(collection);
+      let bestThumb = '';
+      let bestTime = -1;
       for (let i = 0; i < list.length; i++) {
         const item = list[i];
-        if (item && item.ToBeCut !== true && typeof item.VideoId === 'string' && item.VideoId.trim() !== '' && !deletedVideoIds.has(item.VideoId.trim())) {
-          return item.VideoId.trim();
+        if (!item || item.ToBeCut === true || !item.ThumbnailUrl) continue;
+        const vid = typeof item.VideoId === 'string' ? item.VideoId.trim() : '';
+        if (vid && deletedVideoIds.has(vid)) continue;
+        const t = new Date(getEffectiveDateString(item) || 0).getTime();
+        const safeT = isNaN(t) ? 0 : t;
+        if (safeT >= bestTime) {
+          bestTime = safeT;
+          bestThumb = item.ThumbnailUrl;
         }
       }
-      return null;
+      return bestThumb;
     };
-    return extractFirst(channel.Past) || extractFirst(channel.Upcoming) || null;
+    return pickFrom(channel.Past) || pickFrom(channel.Upcoming) || '';
   };
   const buildCleanChannel = (rawChannel, minTime, maxTime) => {
     const actives = normalizeVideoMap(rawChannel.Actives, {
@@ -6801,22 +6820,15 @@ var APP_com_domain_app_ZappingStream = (function () {
     const activeList = sortActiveStreams(Object.values(actives));
     return {
       ...rawChannel,
-      FallbackVideoId: rawChannel.FallbackVideoId || findFallbackVideoId(rawChannel),
+      LatestPreviewThumb: rawChannel.LatestPreviewThumb || findLatestPreviewThumb(rawChannel),
       Actives: actives,
       Upcoming: upcoming,
       Past: past,
       ActiveList: activeList
     };
   };
-
-  /**
-   * Verifica antes del renderizado WebGL si un video de YouTube fue borrado o puesto en privado.
-   * YouTube devuelve HTTP 404 o un placeholder gris de 120x90 para mqdefault.jpg cuando el stream
-   * fue eliminado, mientras que cualquier transmisión válida devuelve 320x180.
-   * Usar Image() nativo sin crossOrigin no consume memoria de texturas WebGL ni sufre bloqueos CORS.
-   */
   const probeSingleVideo = function (videoId) {
-    let timeoutMs = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : 2200;
+    let timeoutMs = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : 2000;
     if (!videoId) return Promise.resolve(false);
     if (deletedVideoIds.has(videoId)) return Promise.resolve(false);
     if (verifiedVideoIds.has(videoId)) return Promise.resolve(true);
@@ -6843,7 +6855,6 @@ var APP_com_domain_app_ZappingStream = (function () {
         resolve(isValid);
       };
       const timer = setTimeout(() => {
-        // Ante red lenta de TV no borramos preventivamente una transmisión válida
         finish(true);
       }, timeoutMs);
       img.onload = () => {
@@ -6860,8 +6871,8 @@ var APP_com_domain_app_ZappingStream = (function () {
     });
   };
   const probeVideoBatch = async function (videoIds) {
-    let concurrency = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : 24;
-    let timeoutMs = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : 2200;
+    let concurrency = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : 12;
+    let timeoutMs = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : 2000;
     const pending = videoIds.filter(id => id && !verifiedVideoIds.has(id) && !deletedVideoIds.has(id));
     if (pending.length === 0) return 0;
     let cursor = 0;
@@ -6956,7 +6967,7 @@ var APP_com_domain_app_ZappingStream = (function () {
         removedCount: 0
       };
     }
-    const removedCount = await probeVideoBatch(unverified, 24, 2000);
+    const removedCount = await probeVideoBatch(unverified, 14, 1800);
     validatedDayKeys.add(dayKey);
     return {
       channels: purgeDeletedFromChannels(channels),
@@ -6969,33 +6980,29 @@ var APP_com_domain_app_ZappingStream = (function () {
   };
 
   /**
-   * Pre-valida silenciosamente en segundo plano todos los días restantes (-7 a +7)
-   * para que al cambiar de día en la grilla los borrados ya estén aplicados sin espera.
+   * Espera a que la pantalla inicial termine de descargar sus logos y miniaturas visibles
+   * y recién después pre-valida suavemente la programación de Hoy sin competir por red ni CPU.
+   * Los demás días se validan bajo demanda justo antes de renderizarse en ScheduleGrid.
    */
   const prevalidateAllScheduleChannels = async (channels, onUpdated) => {
     if (!Array.isArray(channels) || channels.length === 0) return;
-    const allIds = new Set();
-    channels.forEach(ch => {
-      [ch.Actives, ch.Upcoming, ch.Past].forEach(bucket => {
-        if (!bucket) return;
-        Object.values(bucket).forEach(v => {
-          if (v && v.VideoId && !verifiedVideoIds.has(v.VideoId) && !deletedVideoIds.has(v.VideoId)) {
-            allIds.add(v.VideoId);
-          }
-        });
-      });
-    });
-    const queue = Array.from(allIds);
-    if (queue.length === 0) return;
-    const chunkSize = 20;
+
+    // Dejar 4 segundos libres para que las tarjetas visibles carguen a máxima velocidad en la TV
+    await new Promise(r => setTimeout(r, 4000));
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const todayKey = toDayKey(today);
+    if (validatedDayKeys.has(todayKey)) return;
+    const todayIds = collectVideoIdsForDate(channels, today, false).filter(id => !verifiedVideoIds.has(id) && !deletedVideoIds.has(id));
     let totalRemoved = 0;
-    for (let i = 0; i < queue.length; i += chunkSize) {
-      const slice = queue.slice(i, i + chunkSize);
-      const removed = await probeVideoBatch(slice, 12, 2200);
+    const chunkSize = 8;
+    for (let i = 0; i < todayIds.length; i += chunkSize) {
+      const slice = todayIds.slice(i, i + chunkSize);
+      const removed = await probeVideoBatch(slice, 6, 2000);
       totalRemoved += removed;
-      // Pequeña pausa entre tandas para mantener 60fps en la navegación con control remoto
-      await new Promise(r => setTimeout(r, 30));
+      await new Promise(r => setTimeout(r, 180));
     }
+    validatedDayKeys.add(todayKey);
     if (totalRemoved > 0 && typeof onUpdated === 'function') {
       onUpdated(purgeDeletedFromChannels(channels));
     }
@@ -7022,13 +7029,12 @@ var APP_com_domain_app_ZappingStream = (function () {
       const minTime = today.getTime() - SCHEDULE_WINDOW_DAYS * DAY_MS;
       const maxTime = today.getTime() + (SCHEDULE_WINDOW_DAYS + 1) * DAY_MS;
 
-      // 1. Limpieza sincrónica estructural (ToBeCut, IDs vacíos, duplicados y ventana de fechas)
+      // 1. Limpieza sincrónica de ToBeCut, IDs vacíos, duplicados y ventana de fechas
       const sanitized = data.filter(ch => ch && ch.ChannelName).map(ch => buildCleanChannel(ch, minTime, maxTime));
 
-      // 2. Pre-validación ANTES del renderizado para transmisiones en vivo + grilla de Hoy
-      const priorityIds = collectVideoIdsForDate(sanitized, today, true);
-      await probeVideoBatch(priorityIds, 24, 2200);
-      validatedDayKeys.add(toDayKey(today));
+      // 2. Validar únicamente las señales activas (pocas y rápidas) al inicio para no frenar el arranque en TV
+      const activeIds = collectVideoIdsForDate(sanitized, null, true);
+      await probeVideoBatch(activeIds, 16, 1800);
       return purgeDeletedFromChannels(sanitized);
     } catch (err) {
       console.error('Error al obtener los canales:', err);
@@ -7531,9 +7537,9 @@ var APP_com_domain_app_ZappingStream = (function () {
           clipping: true,
           Backdrop: {
             x: 0,
-            y: -80,
+            y: -45,
             w: 1080,
-            h: 540,
+            h: 440,
             alpha: 0
           },
           LeftGradient: {
@@ -7581,10 +7587,6 @@ var APP_com_domain_app_ZappingStream = (function () {
             w: 140,
             rect: true,
             color: COLORS.NETFLIX_RED,
-            shader: {
-              type: Lightning$1.shaders.RoundedRectangle,
-              radius: BORDER_RADIUS.SMALL
-            },
             Label: {
               mount: 0.5,
               x: 70,
@@ -7613,14 +7615,10 @@ var APP_com_domain_app_ZappingStream = (function () {
           },
           Avatar: {
             x: 0,
-            y: 46,
-            w: 48,
-            h: 48,
-            alpha: 0,
-            shader: {
-              type: Lightning$1.shaders.RoundedRectangle,
-              radius: 24
-            }
+            y: 48,
+            w: 46,
+            h: 46,
+            alpha: 0
           },
           ChannelName: {
             x: 0,
@@ -7672,16 +7670,12 @@ var APP_com_domain_app_ZappingStream = (function () {
             w: 380,
             rect: true,
             color: 0x24ffffff,
-            shader: {
-              type: Lightning$1.shaders.RoundedRectangle,
-              radius: BORDER_RADIUS.MEDIUM
-            },
             Label: {
               mountY: 0.5,
               x: 18,
               y: 23,
               text: {
-                text: '▶  Presioná OK para reproducir',
+                text: '▶  OK para reproducir',
                 fontSize: 20,
                 fontStyle: 'bold',
                 fontFace: TYPOGRAPHY.FONT_FAMILY,
@@ -7696,11 +7690,7 @@ var APP_com_domain_app_ZappingStream = (function () {
       this._backdropTimer = null;
       this._currentBackdropSrc = '';
       this.tag('ArtworkWrap.Backdrop').on('txLoaded', () => {
-        this.tag('ArtworkWrap.Backdrop').patch({
-          smooth: {
-            alpha: 0.85
-          }
-        });
+        this.tag('ArtworkWrap.Backdrop').alpha = 0.88;
       });
       this.tag('ArtworkWrap.Backdrop').on('txError', () => {
         this.tag('ArtworkWrap.Backdrop').alpha = 0;
@@ -7731,8 +7721,6 @@ var APP_com_domain_app_ZappingStream = (function () {
       const mainActive = actives.length > 0 ? actives[0] : null;
       const isLive = Boolean(mainActive);
       const isPremiere = Boolean(mainActive && mainActive.IsPremiere);
-
-      // 1. Badge de estado
       let badgeText = 'ON DEMAND';
       let badgeColor = COLORS.BG_ELEVATED;
       let badgeW = 144;
@@ -7751,8 +7739,6 @@ var APP_com_domain_app_ZappingStream = (function () {
           }
         }
       });
-
-      // 2. Línea de ubicación y cantidad de señales
       const metaParts = [];
       if (channel.ChannelCity) {
         metaParts.push(provinceName && provinceName !== channel.ChannelCity ? "".concat(channel.ChannelCity, ", ").concat(provinceName) : channel.ChannelCity);
@@ -7771,33 +7757,27 @@ var APP_com_domain_app_ZappingStream = (function () {
           text: metaParts.join('  •  ')
         }
       });
-
-      // 3. Avatar + Nombre del canal
-      const avatarUrl = channel.ChannelImgUrl ? getOptimizedImageUrl(channel.ChannelImgUrl, 120) : '';
+      const avatarUrl = channel.ChannelImgUrl ? getOptimizedImageUrl(channel.ChannelImgUrl, 80, '', 65) : '';
       if (avatarUrl) {
         if (this._lastAvatarUrl !== avatarUrl) {
           this._lastAvatarUrl = avatarUrl;
           this.tag('Info.Avatar').alpha = 0.001;
           this.tag('Info.Avatar').src = avatarUrl;
         }
-        this.tag('Info.ChannelName').x = 62;
+        this.tag('Info.ChannelName').x = 60;
       } else {
         this._lastAvatarUrl = '';
         this.tag('Info.Avatar').alpha = 0;
         this.tag('Info.ChannelName').x = 0;
       }
       this.tag('Info.ChannelName').text.text = channel.ChannelName || '';
-
-      // 4. Título de transmisión actual y descripción
       if (isLive) {
         this.tag('Info.Headline').text.text = mainActive.Title || 'Transmisión en directo';
         this.tag('Info.Description').text.text = channel.ChannelDescription || 'Señal de streaming en vivo.';
       } else {
         this.tag('Info.Headline').text.text = channel.ChannelDescription || 'Explorá los programas y emisiones recientes de este canal.';
-        this.tag('Info.Description').text.text = channel.ChannelCity ? "Canal de streaming desde ".concat(channel.ChannelCity, ".") : 'Disponible bajo demanda en YouTube.';
+        this.tag('Info.Description').text.text = channel.ChannelCity ? "Canal de streaming desde ".concat(channel.ChannelCity, ".") : 'Seleccioná OK para ver su historial y grilla de transmisiones.';
       }
-
-      // 5. Indicador de acción (100% interno en la app)
       let ctaText = '▶  OK para ver en vivo';
       if (actives.length > 1) {
         ctaText = "\u25B6  OK para elegir transmisi\xF3n (".concat(actives.length, ")");
@@ -7814,9 +7794,12 @@ var APP_com_domain_app_ZappingStream = (function () {
         }
       });
 
-      // 6. Imagen de fondo con debounce corto para no saturar WebGL al hacer scroll rápido
-      const rawBackdrop = mainActive && mainActive.ThumbnailUrl || (channel.ChannelBannerUrl ? "".concat(channel.ChannelBannerUrl, "=w1280-fcrop64=1,00005a57ffffa5a8-k-c0xffffffff-no-nd-rj") : channel.ChannelImgUrl || '');
-      const nextSrc = rawBackdrop ? getOptimizedImageUrl(rawBackdrop, 720, mainActive ? channel.LastActivityAt : '') : '';
+      // En la vista previa superior mostramos la foto de portada (Banner o última miniatura de transmisión;
+      // en vivo mostramos la miniatura del stream activo)
+      const bannerFormatted = channel.ChannelBannerUrl ? formatBannerUrl(channel.ChannelBannerUrl) : '';
+      const isBannerPhoto = Boolean(!isLive && bannerFormatted);
+      const rawBackdrop = isLive ? mainActive.ThumbnailUrl || bannerFormatted || channel.ChannelImgUrl || '' : bannerFormatted || channel.LatestPreviewThumb || channel.ChannelImgUrl || '';
+      const nextSrc = rawBackdrop ? getOptimizedImageUrl(rawBackdrop, isBannerPhoto ? 640 : 480, isLive ? channel.LastActivityAt : '', 66) : '';
       if (this._backdropTimer) {
         clearTimeout(this._backdropTimer);
         this._backdropTimer = null;
@@ -7827,11 +7810,29 @@ var APP_com_domain_app_ZappingStream = (function () {
         return;
       }
       if (this._currentBackdropSrc === nextSrc) return;
+
+      // Debounce de 260ms: si el usuario se desplaza rápido con el control remoto, no decodifica imágenes intermedias
       this._backdropTimer = setTimeout(() => {
         this._currentBackdropSrc = nextSrc;
-        this.tag('ArtworkWrap.Backdrop').alpha = 0.001;
-        this.tag('ArtworkWrap.Backdrop').src = nextSrc;
-      }, 90);
+        const backdrop = this.tag('ArtworkWrap.Backdrop');
+        if (isBannerPhoto) {
+          backdrop.patch({
+            x: 0,
+            y: 15,
+            w: 1080,
+            h: 320
+          });
+        } else {
+          backdrop.patch({
+            x: 0,
+            y: -45,
+            w: 1080,
+            h: 440
+          });
+        }
+        backdrop.alpha = 0.001;
+        backdrop.src = nextSrc;
+      }, 260);
     }
   }
 
@@ -8288,34 +8289,50 @@ var APP_com_domain_app_ZappingStream = (function () {
           x: 64,
           y: 48,
           alpha: 1,
-          w: 640,
+          w: 840,
           h: 60,
           rect: true,
-          color: 0xe6101014,
-          shader: {
-            type: Lightning$1.shaders.RoundedRectangle,
-            radius: BORDER_RADIUS.MEDIUM,
-            stroke: 2,
-            strokeColor: 0x44ffffff
-          },
+          color: 0xe8101014,
           RedAccent: {
             x: 0,
-            y: 12,
-            w: 5,
-            h: 36,
+            y: 0,
+            w: 6,
+            h: 60,
             rect: true,
             color: COLORS.NETFLIX_RED
           },
           Text: {
-            mount: 0.5,
-            x: 320,
+            mountY: 0.5,
+            x: 26,
             y: 31,
             text: {
               text: '↩ Volver   •   OK: Pausar   •   ◀ 15s ▶',
-              fontSize: 22,
+              fontSize: 21,
               fontStyle: 'bold',
               fontFace: TYPOGRAPHY.FONT_FAMILY,
               textColor: COLORS.TEXT_WHITE
+            }
+          },
+          CcPill: {
+            mountX: 1,
+            mountY: 0.5,
+            x: 822,
+            y: 30,
+            w: 210,
+            h: 40,
+            rect: true,
+            color: COLORS.BG_PANEL,
+            Label: {
+              mount: 0.5,
+              x: 105,
+              y: 21,
+              text: {
+                text: '▲▼ CC: OFF',
+                fontSize: 19,
+                fontStyle: 'bold',
+                fontFace: TYPOGRAPHY.FONT_FAMILY,
+                textColor: COLORS.TEXT_GRAY
+              }
             }
           }
         }
@@ -8326,10 +8343,14 @@ var APP_com_domain_app_ZappingStream = (function () {
       this._isClosing = false;
       this._focusInterval = null;
       this._isPlaying = true;
+      this._ccEnabled = false;
+      this._loadedWithCcPolicy = false;
     }
     _active() {
       this._isClosing = false;
-      this._createIframe();
+      this._ccEnabled = false;
+      this._loadedWithCcPolicy = false;
+      this._createIframe(0);
       this._wakeUpControls();
     }
     _inactive() {
@@ -8341,22 +8362,65 @@ var APP_com_domain_app_ZappingStream = (function () {
       this._videoId = id;
       if (this.active) {
         this._destroyIframe();
-        this._createIframe();
+        this._createIframe(0);
       }
     }
     set onClose(callback) {
       this._onCloseCallback = callback;
     }
+    _sendPlayerCommand(func) {
+      let args = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : [];
+      if (this._iframe && this._iframe.contentWindow) {
+        this._iframe.contentWindow.postMessage(JSON.stringify({
+          event: 'command',
+          func,
+          args
+        }), '*');
+      }
+    }
+
+    /**
+     * Fuerza el encendido o apagado real de los módulos de subtítulos (captions y cc en vivo)
+     * dentro del reproductor HTML5 embebido de YouTube.
+     */
+    _applyCaptionsState() {
+      if (!this._iframe || !this._iframe.contentWindow) return;
+      if (this._ccEnabled) {
+        this._sendPlayerCommand('loadModule', ['captions']);
+        this._sendPlayerCommand('loadModule', ['cc']);
+        this._sendPlayerCommand('setOption', ['captions', 'track', {
+          languageCode: 'es'
+        }]);
+        this._sendPlayerCommand('setOption', ['cc', 'track', {
+          languageCode: 'es'
+        }]);
+        this._sendPlayerCommand('setOption', ['captions', 'reload', true]);
+      } else {
+        this._sendPlayerCommand('setOption', ['captions', 'track', {}]);
+        this._sendPlayerCommand('setOption', ['cc', 'track', {}]);
+        this._sendPlayerCommand('unloadModule', ['captions']);
+        this._sendPlayerCommand('unloadModule', ['cc']);
+      }
+    }
     _createIframe() {
+      let resumeSeconds = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : 0;
       if (this._iframe || !this._videoId) return;
-      this._currentTime = 0;
+      this._currentTime = resumeSeconds > 0 ? resumeSeconds : 0;
       this._duration = 0;
+      this._appliedInitialCc = false;
       this._messageListener = event => {
         try {
           const data = JSON.parse(event.data);
-          if (data.event === 'infoDelivery' && data.info) {
+          if (data.event === 'onReady') {
+            this._applyCaptionsState();
+          } else if (data.event === 'infoDelivery' && data.info) {
             if (data.info.currentTime !== undefined) this._currentTime = data.info.currentTime;
             if (data.info.duration !== undefined) this._duration = data.info.duration;
+            // Al iniciar la reproducción (playerState === 1), forzamos el estado de CC elegido
+            if (data.info.playerState === 1 && !this._appliedInitialCc) {
+              this._appliedInitialCc = true;
+              this._applyCaptionsState();
+            }
           }
         } catch (err) {
           // Ignorar mensajes externos que no sean JSON
@@ -8365,9 +8429,13 @@ var APP_com_domain_app_ZappingStream = (function () {
       window.addEventListener('message', this._messageListener);
       const isRemoteHttps = window.location && window.location.protocol === 'https:' && window.location.hostname !== 'localhost';
       const originParam = isRemoteHttps ? "&origin=".concat(encodeURIComponent(window.location.origin)) : '';
+      const ccPolicy = this._ccEnabled ? 1 : 0;
+      const ccLang = this._ccEnabled ? '&cc_lang_pref=es' : '';
+      const startParam = resumeSeconds > 2 ? "&start=".concat(Math.floor(resumeSeconds)) : '';
+      this._loadedWithCcPolicy = this._ccEnabled;
       this._iframe = document.createElement('iframe');
       this._iframe.className = 'tv-iframe';
-      this._iframe.src = "https://www.youtube-nocookie.com/embed/".concat(this._videoId, "?autoplay=1&fs=1&modestbranding=1&rel=0&enablejsapi=1").concat(originParam);
+      this._iframe.src = "https://www.youtube-nocookie.com/embed/".concat(this._videoId, "?autoplay=1&fs=1&modestbranding=1&rel=0&hl=es&cc_load_policy=").concat(ccPolicy).concat(ccLang).concat(startParam, "&enablejsapi=1").concat(originParam);
       this._iframe.frameBorder = '0';
       this._iframe.referrerPolicy = 'strict-origin-when-cross-origin';
       this._iframe.allow = 'accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture';
@@ -8384,6 +8452,7 @@ var APP_com_domain_app_ZappingStream = (function () {
           this._iframe.contentWindow.postMessage(JSON.stringify({
             event: 'listening'
           }), '*');
+          setTimeout(() => this._applyCaptionsState(), 600);
         }
       };
       document.body.appendChild(this._iframe);
@@ -8396,13 +8465,7 @@ var APP_com_domain_app_ZappingStream = (function () {
         this._messageListener = null;
       }
       if (this._iframe) {
-        if (this._iframe.contentWindow) {
-          this._iframe.contentWindow.postMessage(JSON.stringify({
-            event: 'command',
-            func: 'stopVideo',
-            args: []
-          }), '*');
-        }
+        this._sendPlayerCommand('stopVideo', []);
         if (this._iframe.parentNode) {
           this._iframe.parentNode.removeChild(this._iframe);
         }
@@ -8420,11 +8483,7 @@ var APP_com_domain_app_ZappingStream = (function () {
       this.tag('Controls').alpha = 1;
       this._clearTimer();
       this._timer = setTimeout(() => {
-        this.tag('Controls').patch({
-          smooth: {
-            alpha: 0
-          }
-        });
+        this.tag('Controls').alpha = 0;
         this._timer = null;
       }, 4000);
     }
@@ -8439,7 +8498,36 @@ var APP_com_domain_app_ZappingStream = (function () {
       if (this._isPlaying) {
         textNode.text.text = '↩ Volver   •   OK: Pausar   •   ◀ 15s ▶';
       } else {
-        textNode.text.text = '⏸ PAUSADO   •   OK: Reproducir   •   ↩ Volver';
+        textNode.text.text = '⏸ PAUSADO   •   OK: Reproducir   •   ◀ 15s ▶';
+      }
+      this.tag('Controls.CcPill').patch({
+        color: this._ccEnabled ? COLORS.FOCUS_WHITE : COLORS.BG_PANEL,
+        Label: {
+          text: {
+            text: this._ccEnabled ? '▲▼ CC: ACTIVADO' : '▲▼ CC: OFF',
+            textColor: this._ccEnabled ? COLORS.BG_BLACK : COLORS.TEXT_LIGHT
+          }
+        }
+      });
+    }
+    _toggleCaptions() {
+      this._ccEnabled = !this._ccEnabled;
+      this._updateControlsText();
+      this._wakeUpControls();
+      if (!this._ccEnabled) {
+        // Apagado instantáneo sin recargar el video
+        this._applyCaptionsState();
+        return;
+      }
+
+      // Al encender CC: si el iframe se creó inicialmente con cc_load_policy=0,
+      // recargamos con cc_load_policy=1 conservando el segundo actual para cargar pistas automáticas (ASR)
+      if (!this._loadedWithCcPolicy) {
+        const resumeAt = this._duration > 0 && this._currentTime > 2 ? this._currentTime : 0;
+        this._destroyIframe();
+        this._createIframe(resumeAt);
+      } else {
+        this._applyCaptionsState();
       }
     }
     _handleBack() {
@@ -8452,16 +8540,17 @@ var APP_com_domain_app_ZappingStream = (function () {
     }
     _handleEnter() {
       this._isPlaying = !this._isPlaying;
-      if (this._iframe && this._iframe.contentWindow) {
-        const command = this._isPlaying ? 'playVideo' : 'pauseVideo';
-        this._iframe.contentWindow.postMessage(JSON.stringify({
-          event: 'command',
-          func: command,
-          args: []
-        }), '*');
-      }
+      this._sendPlayerCommand(this._isPlaying ? 'playVideo' : 'pauseVideo', []);
       this._updateControlsText();
       this._wakeUpControls();
+      return true;
+    }
+    _handleUp() {
+      this._toggleCaptions();
+      return true;
+    }
+    _handleDown() {
+      this._toggleCaptions();
       return true;
     }
     _handleLeft() {
@@ -8478,15 +8567,15 @@ var APP_com_domain_app_ZappingStream = (function () {
         if (this._duration > 0) {
           this._currentTime = Math.min(this._currentTime, this._duration);
         }
-        this._iframe.contentWindow.postMessage(JSON.stringify({
-          event: 'command',
-          func: 'seekTo',
-          args: [this._currentTime, true]
-        }), '*');
+        this._sendPlayerCommand('seekTo', [this._currentTime, true]);
         this._wakeUpControls();
       }
     }
-    _handleKey() {
+    _handleKey(e) {
+      if (e && (e.keyCode === 460 || e.keyCode === 10221 || e.key === 'Caption' || e.key === 'Subtitle' || e.key === 'c' || e.key === 'C')) {
+        this._toggleCaptions();
+        return true;
+      }
       this._wakeUpControls();
       return false;
     }
@@ -8498,20 +8587,20 @@ var APP_com_domain_app_ZappingStream = (function () {
         w: 340,
         h: 191,
         rect: true,
-        color: COLORS.BG_CARD,
+        color: 0xff1e1e26,
         clipping: true,
         Fallback: {
           w: w => w,
           h: h => h,
           rect: true,
-          color: 0xff22222a,
+          color: 0xff22222c,
           Initials: {
             mount: 0.5,
             x: w => w / 2,
             y: h => h / 2,
             text: {
               text: '',
-              fontSize: 42,
+              fontSize: 40,
               fontStyle: 'bold',
               fontFace: TYPOGRAPHY.FONT_FAMILY,
               textColor: 0x44ffffff
@@ -8519,19 +8608,22 @@ var APP_com_domain_app_ZappingStream = (function () {
           }
         },
         Image: {
-          w: w => w,
-          h: h => h,
+          x: 0,
+          y: 0,
+          w: 340,
+          h: 191,
           alpha: 0.001
         },
         BottomScrim: {
           x: 0,
-          y: h => h - 52,
+          y: h => h - 48,
           w: w => w,
-          h: 52,
+          h: 48,
           rect: true,
           colorTop: 0x00000000,
-          colorBottom: 0xb8000000
+          colorBottom: 0xb0000000
         },
+        // Badge sin shader RoundedRectangle para aliviar al máximo la GPU del televisor
         Badge: {
           mountX: 1,
           mountY: 1,
@@ -8542,10 +8634,6 @@ var APP_com_domain_app_ZappingStream = (function () {
           rect: true,
           color: COLORS.LIVE_BADGE,
           alpha: 0,
-          shader: {
-            type: Lightning$1.shaders.RoundedRectangle,
-            radius: BORDER_RADIUS.SMALL
-          },
           Dot: {
             w: 6,
             h: 6,
@@ -8583,8 +8671,6 @@ var APP_com_domain_app_ZappingStream = (function () {
     _showFallbackOnly() {
       this.tag('Image').alpha = 0;
       this.tag('Fallback').alpha = 1;
-      // Nota clave para TV: NO disparamos re-renderizados ni borrados de la grilla en tiempo de WebGL.
-      // Los borrados ya ocurrieron previamente en channelService antes de montar la vista.
       if (typeof this.onImageError === 'function') {
         this.onImageError();
       }
@@ -8592,12 +8678,38 @@ var APP_com_domain_app_ZappingStream = (function () {
     set item(data) {
       if (!data) return;
       const oldSrc = this._finalSrc;
+      const isLogoMode = Boolean(data.isLogoMode);
       this._fallbackText = data.fallbackText || data.altText || '';
       this.onClick = data.onClick;
       this.onImageError = data.onImageError;
+      const cardW = this.w || 340;
+      const cardH = this.h || 191;
+
+      // Ajustar geometría de la imagen: logo cuadrado centrado para On Demand vs 16:9 completo para Vivo/EPG
+      if (isLogoMode) {
+        const logoSize = 128;
+        this.tag('Image').patch({
+          mount: 0.5,
+          x: Math.round(cardW / 2),
+          y: Math.round(cardH / 2),
+          w: logoSize,
+          h: logoSize
+        });
+        this.tag('BottomScrim').alpha = 0;
+      } else {
+        this.tag('Image').patch({
+          mount: 0,
+          x: 0,
+          y: 0,
+          w: cardW,
+          h: cardH
+        });
+        this.tag('BottomScrim').alpha = 1;
+      }
       const initials = this._fallbackText ? this._fallbackText.trim().split(/\s+/).slice(0, 2).map(w => w.charAt(0).toUpperCase()).join('') : 'TV';
       this.tag('Fallback.Initials').text.text = initials;
-      const nextSrc = data.imageUrl ? getOptimizedImageUrl(data.imageUrl, 380, data.cacheKey) : '';
+      const targetImgWidth = isLogoMode ? 150 : 320;
+      const nextSrc = data.imageUrl ? getOptimizedImageUrl(data.imageUrl, targetImgWidth, data.cacheKey, 65) : '';
       if (nextSrc) {
         if (oldSrc !== nextSrc || !this.tag('Image').src) {
           this._finalSrc = nextSrc;
@@ -8666,6 +8778,8 @@ var APP_com_domain_app_ZappingStream = (function () {
   const EVENT_H = 254;
   const EVENT_STEP = 356; // 336 + 20 gap
   const ROW_STRIDE = 276; // 254 + 22 gap
+  const SIDEBAR_W = 224;
+  const BORDER$1 = 4;
 
   // ==========================================
   // 1. Píldora de Día (DayButton)
@@ -8783,10 +8897,6 @@ var APP_com_domain_app_ZappingStream = (function () {
           h: EVENT_H,
           rect: true,
           color: COLORS.BG_DARK,
-          shader: {
-            type: Lightning$1.shaders.RoundedRectangle,
-            radius: BORDER_RADIUS.MEDIUM
-          },
           clipping: true,
           VideoWrapper: {
             x: 0,
@@ -8798,22 +8908,18 @@ var APP_com_domain_app_ZappingStream = (function () {
           TimeBadge: {
             x: 10,
             y: 10,
-            h: 28,
+            h: 26,
             w: 92,
             rect: true,
             color: 0xd90a0a0c,
-            shader: {
-              type: Lightning$1.shaders.RoundedRectangle,
-              radius: BORDER_RADIUS.SMALL
-            },
             zIndex: 2,
             Label: {
-              x: 10,
+              x: 9,
               mountY: 0.5,
-              y: 15,
+              y: 14,
               text: {
                 text: '',
-                fontSize: 16,
+                fontSize: 15,
                 fontStyle: 'bold',
                 fontFace: TYPOGRAPHY.FONT_FAMILY,
                 textColor: COLORS.TEXT_WHITE
@@ -8846,17 +8952,37 @@ var APP_com_domain_app_ZappingStream = (function () {
         },
         FocusRing: {
           alpha: 0,
-          x: -3,
-          y: -3,
-          w: EVENT_W + 6,
-          h: EVENT_H + 6,
-          rect: true,
-          color: COLORS.TRANSPARENT,
-          shader: {
-            type: Lightning$1.shaders.RoundedRectangle,
-            radius: BORDER_RADIUS.LARGE,
-            stroke: 4,
-            strokeColor: COLORS.FOCUS_WHITE
+          Top: {
+            x: -BORDER$1,
+            y: -BORDER$1,
+            w: EVENT_W + BORDER$1 * 2,
+            h: BORDER$1,
+            rect: true,
+            color: COLORS.FOCUS_WHITE
+          },
+          Bottom: {
+            x: -BORDER$1,
+            y: EVENT_H,
+            w: EVENT_W + BORDER$1 * 2,
+            h: BORDER$1,
+            rect: true,
+            color: COLORS.FOCUS_WHITE
+          },
+          Left: {
+            x: -BORDER$1,
+            y: 0,
+            w: BORDER$1,
+            h: EVENT_H,
+            rect: true,
+            color: COLORS.FOCUS_WHITE
+          },
+          Right: {
+            x: EVENT_W,
+            y: 0,
+            w: BORDER$1,
+            h: EVENT_H,
+            rect: true,
+            color: COLORS.FOCUS_WHITE
           }
         }
       };
@@ -8874,7 +9000,7 @@ var APP_com_domain_app_ZappingStream = (function () {
       } else if (ev.Live) {
         timeText = "\u25CF ".concat(start);
       }
-      const badgeW = Math.max(timeText.length * 10 + 20, 74);
+      const badgeW = Math.max(timeText.length * 9 + 20, 72);
       this.tag('CardBody.TimeBadge').patch({
         w: badgeW,
         color: ev.Live ? COLORS.NETFLIX_RED : 0xd90a0a0c,
@@ -8885,9 +9011,11 @@ var APP_com_domain_app_ZappingStream = (function () {
           }
         }
       });
+      const hasStreamThumb = Boolean(ev.ThumbnailUrl);
       const rawImageUrl = ev.ThumbnailUrl || ev.channel.ChannelImgUrl || '';
       this.tag('CardBody.VideoWrapper').item = {
         imageUrl: rawImageUrl,
+        isLogoMode: !hasStreamThumb,
         cacheKey: ev.Live ? ev.channel.LastActivityAt : '',
         altText: ev.Title,
         fallbackText: ev.channel.ChannelName,
@@ -8901,9 +9029,6 @@ var APP_com_domain_app_ZappingStream = (function () {
     _focus() {
       this.patch({
         zIndex: 10,
-        smooth: {
-          scale: 1.03
-        },
         FocusRing: {
           alpha: 1
         },
@@ -8922,9 +9047,6 @@ var APP_com_domain_app_ZappingStream = (function () {
     _unfocus() {
       this.patch({
         zIndex: 1,
-        smooth: {
-          scale: 1.0
-        },
         FocusRing: {
           alpha: 0
         },
@@ -8959,40 +9081,28 @@ var APP_com_domain_app_ZappingStream = (function () {
         Sidebar: {
           x: SPACING.SAFE_X,
           y: 0,
-          w: 224,
+          w: SIDEBAR_W,
           h: EVENT_H,
           Card: {
-            w: 224,
+            w: SIDEBAR_W,
             h: EVENT_H,
             rect: true,
             color: COLORS.BG_DARK,
-            shader: {
-              type: Lightning$1.shaders.RoundedRectangle,
-              radius: BORDER_RADIUS.MEDIUM
-            },
             Logo: {
               x: 80,
               y: 22,
               w: 64,
               h: 64,
-              alpha: 0,
-              shader: {
-                type: Lightning$1.shaders.RoundedRectangle,
-                radius: 32
-              }
+              alpha: 0
             },
             LiveDot: {
               alpha: 0,
-              x: 132,
-              y: 72,
-              w: 14,
-              h: 14,
+              x: 134,
+              y: 74,
+              w: 12,
+              h: 12,
               rect: true,
-              color: COLORS.NETFLIX_RED,
-              shader: {
-                type: Lightning$1.shaders.RoundedRectangle,
-                radius: 7
-              }
+              color: COLORS.NETFLIX_RED
             },
             Name: {
               x: 14,
@@ -9013,19 +9123,15 @@ var APP_com_domain_app_ZappingStream = (function () {
             },
             InfoPill: {
               x: 24,
-              y: 192,
+              y: 194,
               w: 176,
-              h: 40,
+              h: 38,
               rect: true,
               color: COLORS.BG_PANEL,
-              shader: {
-                type: Lightning$1.shaders.RoundedRectangle,
-                radius: BORDER_RADIUS.PILL
-              },
               Label: {
                 mount: 0.5,
                 x: 88,
-                y: 21,
+                y: 20,
                 text: {
                   text: 'Info canal',
                   fontSize: 16,
@@ -9038,17 +9144,37 @@ var APP_com_domain_app_ZappingStream = (function () {
           },
           SidebarFocusRing: {
             alpha: 0,
-            x: -3,
-            y: -3,
-            w: 230,
-            h: EVENT_H + 6,
-            rect: true,
-            color: COLORS.TRANSPARENT,
-            shader: {
-              type: Lightning$1.shaders.RoundedRectangle,
-              radius: BORDER_RADIUS.LARGE,
-              stroke: 4,
-              strokeColor: COLORS.FOCUS_WHITE
+            Top: {
+              x: -BORDER$1,
+              y: -BORDER$1,
+              w: SIDEBAR_W + BORDER$1 * 2,
+              h: BORDER$1,
+              rect: true,
+              color: COLORS.FOCUS_WHITE
+            },
+            Bottom: {
+              x: -BORDER$1,
+              y: EVENT_H,
+              w: SIDEBAR_W + BORDER$1 * 2,
+              h: BORDER$1,
+              rect: true,
+              color: COLORS.FOCUS_WHITE
+            },
+            Left: {
+              x: -BORDER$1,
+              y: 0,
+              w: BORDER$1,
+              h: EVENT_H,
+              rect: true,
+              color: COLORS.FOCUS_WHITE
+            },
+            Right: {
+              x: SIDEBAR_W,
+              y: 0,
+              w: BORDER$1,
+              h: EVENT_H,
+              rect: true,
+              color: COLORS.FOCUS_WHITE
             }
           }
         },
@@ -9068,7 +9194,7 @@ var APP_com_domain_app_ZappingStream = (function () {
     }
     _construct() {
       this._index = 1; // 0 = Sidebar del canal, 1..N = Eventos
-      this._poolSize = 12;
+      this._poolSize = 10;
       this._eventsPool = null;
     }
     _init() {
@@ -9098,7 +9224,7 @@ var APP_com_domain_app_ZappingStream = (function () {
       this._item = data;
       const row = data.row,
         toggleInfo = data.toggleInfo;
-      const logoSrc = row.channel.ChannelImgUrl ? getOptimizedImageUrl(row.channel.ChannelImgUrl, 128) : '';
+      const logoSrc = row.channel.ChannelImgUrl ? getOptimizedImageUrl(row.channel.ChannelImgUrl, 84, '', 65) : '';
       if (logoSrc) {
         if (this._lastLogoSrc !== logoSrc) {
           this._lastLogoSrc = logoSrc;
@@ -9132,7 +9258,7 @@ var APP_com_domain_app_ZappingStream = (function () {
         ev.x = -9999;
       });
       this._updateSidebarFocusVisual();
-      this._updateScroll(true);
+      this._updateScroll();
     }
     _updateSidebarFocusVisual() {
       const sidebarActive = this.hasFocus() && this._index === 0;
@@ -9150,7 +9276,7 @@ var APP_com_domain_app_ZappingStream = (function () {
       if (this._index > 0) {
         this._index--;
         this._updateSidebarFocusVisual();
-        this._updateScroll(false);
+        this._updateScroll();
         this._refocus();
         return true;
       }
@@ -9160,17 +9286,16 @@ var APP_com_domain_app_ZappingStream = (function () {
       if (this._eventsData && this._index < this._eventsData.length) {
         this._index++;
         this._updateSidebarFocusVisual();
-        this._updateScroll(false);
+        this._updateScroll();
         this._refocus();
         return true;
       }
       return false;
     }
     _updateScroll() {
-      let instant = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : false;
       if (!this._eventsData || this._eventsData.length === 0) return;
       const evIndex = Math.max(0, this._index - 1);
-      const trackW = 1920 - 308 - SPACING.SAFE_X; // 1548px
+      const trackW = 1920 - 308 - SPACING.SAFE_X;
       const totalW = this._eventsData.length * EVENT_STEP - 20;
       let targetX = 8;
       if (this._index > 0 && totalW > trackW) {
@@ -9178,21 +9303,7 @@ var APP_com_domain_app_ZappingStream = (function () {
         const minX = trackW - totalW - 8;
         targetX = Math.max(minX, Math.min(8, rawX));
       }
-      if (instant) {
-        this.tag('TrackBounds.Slider').x = targetX;
-      } else {
-        this.tag('TrackBounds.Slider').patch({
-          smooth: {
-            x: [targetX, {
-              duration: 0.16
-            }]
-          }
-        });
-      }
-
-      // IMPORTANTE: Calculamos el rango visible [startIdx, endIdx] en base a targetX real del Slider
-      // (y no solo evIndex - 1), para que cuando el foco arranque en un vivo a la derecha o al final
-      // de la fila TODAS las tarjetas visibles a su izquierda se rendericen desde el primer cuadro.
+      this.tag('TrackBounds.Slider').x = targetX;
       const leftVisibleCoord = Math.max(0, -targetX);
       const rightVisibleCoord = leftVisibleCoord + trackW;
       const startIdx = Math.max(0, Math.floor(leftVisibleCoord / EVENT_STEP) - 1);
@@ -9285,7 +9396,7 @@ var APP_com_domain_app_ZappingStream = (function () {
       };
     }
     _construct() {
-      this._focusY = 0; // 0 = Selector de días, 1..N = Filas de canales
+      this._focusY = 0;
       this._dayIndex = 7;
       this._rowsComponents = null;
       this._rowsData = [];
@@ -9326,27 +9437,16 @@ var APP_com_domain_app_ZappingStream = (function () {
       });
       this.tag('DaysRailBounds.Slider.Items').children = daysItems;
       this._dayButtons = this.tag('DaysRailBounds.Slider.Items').children;
-      this._centerDaySlider(true);
+      this._centerDaySlider();
     }
     _centerDaySlider() {
-      let instant = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : false;
       const railW = 1920 - SPACING.SAFE_X * 2;
       const totalW = this._days.length * DAY_BTN_STEP - 14;
       const centerOffset = Math.round((railW - DAY_BTN_W) / 2);
       const rawX = -(this._dayIndex * DAY_BTN_STEP) + centerOffset;
       const minX = railW - totalW;
       const targetX = Math.max(minX, Math.min(0, rawX));
-      if (instant) {
-        this.tag('DaysRailBounds.Slider').x = targetX;
-      } else {
-        this.tag('DaysRailBounds.Slider').patch({
-          smooth: {
-            x: [targetX, {
-              duration: 0.16
-            }]
-          }
-        });
-      }
+      this.tag('DaysRailBounds.Slider').x = targetX;
     }
     _channelHasEventsOnDate(channel, dateObj) {
       const buckets = [channel.Actives, channel.Upcoming, channel.Past];
@@ -9370,16 +9470,12 @@ var APP_com_domain_app_ZappingStream = (function () {
     _pickBestDayForChannels(channels) {
       if (!channels || channels.length === 0) return null;
       const hasOnDay = dateObj => channels.some(ch => this._channelHasEventsOnDate(ch, dateObj));
-
-      // 1. Priorizar Hoy si tiene eventos
       if (hasOnDay(this._today)) {
         return {
           date: new Date(this._today),
           dayIdx: 7
         };
       }
-
-      // 2. Buscar el día pasado más reciente con transmisiones (ayer -> hace 7 días)
       for (let idx = 6; idx >= 0; idx--) {
         if (hasOnDay(this._days[idx])) {
           return {
@@ -9388,8 +9484,6 @@ var APP_com_domain_app_ZappingStream = (function () {
           };
         }
       }
-
-      // 3. Si no hay pasadas, buscar la próxima fecha futura más cercana
       for (let idx = 8; idx < this._days.length; idx++) {
         if (hasOnDay(this._days[idx])) {
           return {
@@ -9415,7 +9509,7 @@ var APP_com_domain_app_ZappingStream = (function () {
         if (best) {
           this._selectedDate = best.date;
           this._dayIndex = best.dayIdx;
-          this._centerDaySlider(true);
+          this._centerDaySlider();
         }
         this._pendingAutoFocusRow = true;
       }
@@ -9510,7 +9604,7 @@ var APP_com_domain_app_ZappingStream = (function () {
         this.tag('EpgContainerBounds').alpha = 1;
       }
       if (!this._rowsComponents) {
-        this._poolSize = 8;
+        this._poolSize = 6;
         const rowItems = [];
         for (let i = 0; i < this._poolSize; i++) {
           rowItems.push({
@@ -9533,7 +9627,7 @@ var APP_com_domain_app_ZappingStream = (function () {
       } else if (this._focusY > this._rowsData.length) {
         this._focusY = this._rowsData.length;
       }
-      this._updateScrollVertical(true);
+      this._updateScrollVertical();
       if (this.hasFocus()) {
         this._refocus();
       }
@@ -9546,7 +9640,7 @@ var APP_com_domain_app_ZappingStream = (function () {
     _handleUp() {
       if (this._focusY > 0) {
         this._focusY--;
-        this._updateScrollVertical(false);
+        this._updateScrollVertical();
         this._refocus();
         return true;
       }
@@ -9556,7 +9650,7 @@ var APP_com_domain_app_ZappingStream = (function () {
       if (this._isValidatingDay) return true;
       if (this._rowsData && this._focusY < this._rowsData.length) {
         this._focusY++;
-        this._updateScrollVertical(false);
+        this._updateScrollVertical();
         this._refocus();
         return true;
       }
@@ -9565,7 +9659,7 @@ var APP_com_domain_app_ZappingStream = (function () {
     _handleLeft() {
       if (this._focusY === 0 && this._dayIndex > 0) {
         this._dayIndex--;
-        this._centerDaySlider(false);
+        this._centerDaySlider();
         this._refocus();
         return true;
       }
@@ -9574,14 +9668,13 @@ var APP_com_domain_app_ZappingStream = (function () {
     _handleRight() {
       if (this._focusY === 0 && this._dayButtons && this._dayIndex < this._dayButtons.length - 1) {
         this._dayIndex++;
-        this._centerDaySlider(false);
+        this._centerDaySlider();
         this._refocus();
         return true;
       }
       return false;
     }
     _updateScrollVertical() {
-      let instant = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : false;
       const rowIndex = Math.max(0, this._focusY - 1);
       const viewportH = 840;
       const totalH = this._rowsData.length * ROW_STRIDE - 22;
@@ -9591,20 +9684,8 @@ var APP_com_domain_app_ZappingStream = (function () {
         const minY = viewportH - totalH - 12;
         targetY = Math.max(minY, Math.min(4, rawY));
       }
-      if (instant) {
-        this.tag('EpgContainerBounds.Slider').y = targetY;
-      } else {
-        this.tag('EpgContainerBounds.Slider').patch({
-          smooth: {
-            y: [targetY, {
-              duration: 0.16
-            }]
-          }
-        });
-      }
+      this.tag('EpgContainerBounds.Slider').y = targetY;
       if (!this._rowsData || this._rowsData.length === 0) return;
-
-      // Rango vertical visible calculado en base a targetY real del Slider
       const topVisibleCoord = Math.max(0, -targetY);
       const bottomVisibleCoord = topVisibleCoord + viewportH;
       const startIdx = Math.max(0, Math.floor(topVisibleCoord / ROW_STRIDE) - 1);
@@ -9647,25 +9728,24 @@ var APP_com_domain_app_ZappingStream = (function () {
     }
   }
 
+  const W = COMPONENT_SIZE.CARD_WIDTH;
+  const H = COMPONENT_SIZE.CARD_HEIGHT;
+  const BORDER = 4;
   class ChannelCard extends Lightning$1.Component {
     static _template() {
       return {
-        w: COMPONENT_SIZE.CARD_WIDTH,
-        h: COMPONENT_SIZE.CARD_HEIGHT,
+        w: W,
+        h: H,
         Body: {
-          w: COMPONENT_SIZE.CARD_WIDTH,
-          h: COMPONENT_SIZE.CARD_HEIGHT,
+          w: W,
+          h: H,
           rect: true,
           color: COLORS.BG_DARK,
-          shader: {
-            type: Lightning$1.shaders.RoundedRectangle,
-            radius: BORDER_RADIUS.MEDIUM
-          },
           clipping: true,
           Thumb: {
             x: 0,
             y: 0,
-            w: COMPONENT_SIZE.CARD_WIDTH,
+            w: W,
             h: 191,
             type: VideoCard
           },
@@ -9673,21 +9753,17 @@ var APP_com_domain_app_ZappingStream = (function () {
             alpha: 0,
             x: 10,
             y: 10,
-            h: 26,
-            w: 112,
+            h: 24,
+            w: 108,
             rect: true,
             color: 0xd90a0a0c,
-            shader: {
-              type: Lightning$1.shaders.RoundedRectangle,
-              radius: BORDER_RADIUS.SMALL
-            },
             Label: {
               mount: 0.5,
-              x: 56,
-              y: 14,
+              x: 54,
+              y: 13,
               text: {
                 text: '',
-                fontSize: 14,
+                fontSize: 13,
                 fontStyle: 'bold',
                 fontFace: TYPOGRAPHY.FONT_FAMILY,
                 textColor: COLORS.TEXT_WHITE
@@ -9697,23 +9773,19 @@ var APP_com_domain_app_ZappingStream = (function () {
           MetaStrip: {
             x: 0,
             y: 191,
-            w: COMPONENT_SIZE.CARD_WIDTH,
+            w: W,
             h: 57,
             rect: true,
             color: COLORS.BG_CARD,
             Logo: {
               x: 12,
-              y: 12,
-              w: 33,
-              h: 33,
-              alpha: 0,
-              shader: {
-                type: Lightning$1.shaders.RoundedRectangle,
-                radius: 17
-              }
+              y: 13,
+              w: 31,
+              h: 31,
+              alpha: 0
             },
             ChannelTitle: {
-              x: 54,
+              x: 52,
               y: 7,
               text: {
                 text: '',
@@ -9722,12 +9794,12 @@ var APP_com_domain_app_ZappingStream = (function () {
                 fontFace: TYPOGRAPHY.FONT_FAMILY,
                 textColor: COLORS.TEXT_WHITE,
                 maxLines: 1,
-                wordWrapWidth: 274,
+                wordWrapWidth: 276,
                 textOverflow: 'ellipsis'
               }
             },
             Subtitle: {
-              x: 54,
+              x: 52,
               y: 31,
               text: {
                 text: '',
@@ -9735,26 +9807,46 @@ var APP_com_domain_app_ZappingStream = (function () {
                 fontFace: TYPOGRAPHY.FONT_FAMILY,
                 textColor: COLORS.TEXT_GRAY,
                 maxLines: 1,
-                wordWrapWidth: 274,
+                wordWrapWidth: 276,
                 textOverflow: 'ellipsis'
               }
             }
           }
         },
-        // Anillo de foco pre-instanciado (evita recompilar shaders al navegar con el control)
+        // Marco de foco con 4 rectángulos nativos (cero costo de fragment shaders en Smart TV)
         FocusRing: {
           alpha: 0,
-          x: -3,
-          y: -3,
-          w: COMPONENT_SIZE.CARD_WIDTH + 6,
-          h: COMPONENT_SIZE.CARD_HEIGHT + 6,
-          rect: true,
-          color: COLORS.TRANSPARENT,
-          shader: {
-            type: Lightning$1.shaders.RoundedRectangle,
-            radius: BORDER_RADIUS.LARGE,
-            stroke: 4,
-            strokeColor: COLORS.FOCUS_WHITE
+          Top: {
+            x: -BORDER,
+            y: -BORDER,
+            w: W + BORDER * 2,
+            h: BORDER,
+            rect: true,
+            color: COLORS.FOCUS_WHITE
+          },
+          Bottom: {
+            x: -BORDER,
+            y: H,
+            w: W + BORDER * 2,
+            h: BORDER,
+            rect: true,
+            color: COLORS.FOCUS_WHITE
+          },
+          Left: {
+            x: -BORDER,
+            y: 0,
+            w: BORDER,
+            h: H,
+            rect: true,
+            color: COLORS.FOCUS_WHITE
+          },
+          Right: {
+            x: W,
+            y: 0,
+            w: BORDER,
+            h: H,
+            rect: true,
+            color: COLORS.FOCUS_WHITE
           }
         }
       };
@@ -9782,27 +9874,22 @@ var APP_com_domain_app_ZappingStream = (function () {
       const activeVideos = isLiveGroup ? channel.ActiveList || Object.values(channel.Actives || {}) : [];
       this._activeVideos = activeVideos;
       const mainActive = activeVideos.length > 0 ? activeVideos[0] : null;
+      const isLiveCard = Boolean(isLiveGroup && mainActive);
 
-      // Miniatura 16:9
-      let rawThumb = channel.ChannelImgUrl || '';
-      if (isLiveGroup && mainActive) {
-        rawThumb = mainActive.ThumbnailUrl || channel.ChannelImgUrl || '';
-      } else if (!isLiveGroup && channel.ChannelBannerUrl) {
-        rawThumb = "".concat(channel.ChannelBannerUrl, "=w640-fcrop64=1,00005a57ffffa5a8-k-c0xffffffff-no-nd-rj");
-      }
+      // En Vivo: miniatura 16:9 de la transmisión. On Demand: SIEMPRE el logo del canal centrado.
+      const rawThumb = isLiveCard ? mainActive.ThumbnailUrl || channel.ChannelImgUrl || '' : channel.ChannelImgUrl || '';
       this.tag('Body.Thumb').item = {
         imageUrl: rawThumb,
-        cacheKey: isLiveGroup && mainActive ? channel.LastActivityAt : '',
+        isLogoMode: !isLiveCard,
+        cacheKey: isLiveCard ? channel.LastActivityAt : '',
         altText: mainActive ? mainActive.Title : channel.ChannelName,
         fallbackText: channel.ChannelName,
-        isLive: Boolean(isLiveGroup && mainActive && mainActive.Live !== false),
+        isLive: Boolean(isLiveCard && mainActive.Live !== false),
         isPremiere: Boolean(mainActive && mainActive.IsPremiere)
       };
-
-      // Indicador de múltiples transmisiones simultáneas
-      if (isLiveGroup && activeVideos.length > 1) {
+      if (isLiveCard && activeVideos.length > 1) {
         const text = "".concat(activeVideos.length, " EN VIVO");
-        const w = text.length * 8 + 24;
+        const w = text.length * 8 + 22;
         this.tag('Body.MultiStreamBadge').patch({
           alpha: 1,
           w,
@@ -9817,18 +9904,19 @@ var APP_com_domain_app_ZappingStream = (function () {
         this.tag('Body.MultiStreamBadge').alpha = 0;
       }
 
-      // Logo pequeño + Textos inferiores
-      const logoUrl = channel.ChannelImgUrl ? getOptimizedImageUrl(channel.ChannelImgUrl, 80) : '';
-      if (logoUrl) {
+      // Solo cargamos el mini-avatar inferior en las tarjetas En Vivo (en On Demand ya se ve grande arriba)
+      const showMiniLogo = Boolean(isLiveCard && channel.ChannelImgUrl);
+      if (showMiniLogo) {
+        const logoUrl = getOptimizedImageUrl(channel.ChannelImgUrl, 56, '', 65);
         if (this._lastLogoUrl !== logoUrl) {
           this._lastLogoUrl = logoUrl;
           this.tag('Body.MetaStrip.Logo').alpha = 0.001;
           this.tag('Body.MetaStrip.Logo').src = logoUrl;
         }
-        this.tag('Body.MetaStrip.ChannelTitle').x = 54;
-        this.tag('Body.MetaStrip.Subtitle').x = 54;
-        this.tag('Body.MetaStrip.ChannelTitle').text.wordWrapWidth = 274;
-        this.tag('Body.MetaStrip.Subtitle').text.wordWrapWidth = 274;
+        this.tag('Body.MetaStrip.ChannelTitle').x = 52;
+        this.tag('Body.MetaStrip.Subtitle').x = 52;
+        this.tag('Body.MetaStrip.ChannelTitle').text.wordWrapWidth = 276;
+        this.tag('Body.MetaStrip.Subtitle').text.wordWrapWidth = 276;
       } else {
         this._lastLogoUrl = '';
         this.tag('Body.MetaStrip.Logo').alpha = 0;
@@ -9838,7 +9926,7 @@ var APP_com_domain_app_ZappingStream = (function () {
         this.tag('Body.MetaStrip.Subtitle').text.wordWrapWidth = 312;
       }
       this.tag('Body.MetaStrip.ChannelTitle').text.text = channel.ChannelName || '';
-      if (isLiveGroup && mainActive) {
+      if (isLiveCard) {
         this.tag('Body.MetaStrip.Subtitle').text.text = mainActive.Title || 'En vivo ahora';
       } else {
         this.tag('Body.MetaStrip.Subtitle').text.text = channel.ChannelCity ? "\uD83D\uDCCD ".concat(channel.ChannelCity) : 'Ver transmisiones';
@@ -9847,9 +9935,6 @@ var APP_com_domain_app_ZappingStream = (function () {
     _focus() {
       this.patch({
         zIndex: 10,
-        smooth: {
-          scale: 1.05
-        },
         FocusRing: {
           alpha: 1
         },
@@ -9871,9 +9956,6 @@ var APP_com_domain_app_ZappingStream = (function () {
     _unfocus() {
       this.patch({
         zIndex: 1,
-        smooth: {
-          scale: 1.0
-        },
         FocusRing: {
           alpha: 0
         },
@@ -9949,7 +10031,7 @@ var APP_com_domain_app_ZappingStream = (function () {
     }
     _init() {
       this._index = 0;
-      this._poolSize = 12;
+      this._poolSize = 10;
       const items = [];
       for (let i = 0; i < this._poolSize; i++) {
         items.push({
@@ -10039,7 +10121,6 @@ var APP_com_domain_app_ZappingStream = (function () {
       return false;
     }
     _updateScroll() {
-      let instant = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : false;
       if (!this._channelData || this._channelData.length === 0) return;
       const totalContentWidth = this._channelData.length * CARD_STEP - SPACING.GAP_LARGE + SPACING.SAFE_X * 2;
       const visibleTrackWidth = 1920 - SPACING.SAFE_X;
@@ -10050,17 +10131,9 @@ var APP_com_domain_app_ZappingStream = (function () {
       } else {
         targetX = SPACING.SAFE_X;
       }
-      if (instant) {
-        this.tag('Slider').x = targetX;
-      } else {
-        this.tag('Slider').patch({
-          smooth: {
-            x: [targetX, {
-              duration: 0.18
-            }]
-          }
-        });
-      }
+
+      // Desplazamiento directo sin interpolación pesada para respuesta instantánea en Smart TV
+      this.tag('Slider').x = targetX;
 
       // Ventana de virtualización basada en la posición real targetX del Slider
       const leftVisibleCoord = Math.max(0, SPACING.SAFE_X - targetX);
@@ -10919,7 +10992,6 @@ var APP_com_domain_app_ZappingStream = (function () {
       this._refocus();
     }
     _syncRailsScroll() {
-      let instant = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : false;
       const liveRow = this.tag('Main.Content.CardsSection.RailsViewport.RailsSlider.CardsLive');
       const demandRow = this.tag('Main.Content.CardsSection.RailsViewport.RailsSlider.CardsDemand');
       const slider = this.tag('Main.Content.CardsSection.RailsViewport.RailsSlider');
@@ -10929,17 +11001,7 @@ var APP_com_domain_app_ZappingStream = (function () {
       if (hasLive && hasDemand && this._contentRowIndex === 1) {
         targetY = -256;
       }
-      if (instant) {
-        slider.y = targetY;
-      } else {
-        slider.patch({
-          smooth: {
-            y: [targetY, {
-              duration: 0.2
-            }]
-          }
-        });
-      }
+      slider.y = targetY;
       const activeRow = this._contentRowIndex === 0 && hasLive ? liveRow : hasDemand ? demandRow : hasLive ? liveRow : null;
       if (activeRow) {
         const ch = activeRow.getFocusedChannel();
